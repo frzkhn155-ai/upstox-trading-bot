@@ -1,0 +1,54 @@
+name: Trading Bot
+
+on:
+  schedule:
+    - cron: '30 3 * * 1-5'
+    - cron: '30 6 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 359
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run trading bot
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          UPSTOX_API_KEY:      ${{ secrets.UPSTOX_API_KEY }}
+          UPSTOX_API_SECRET:   ${{ secrets.UPSTOX_API_SECRET }}
+          UPSTOX_EMAIL:        ${{ secrets.UPSTOX_EMAIL }}
+          UPSTOX_EMAIL_PWD:    ${{ secrets.UPSTOX_EMAIL_PWD }}
+          UPSTOX_MOBILE:       ${{ secrets.UPSTOX_MOBILE }}
+          UPSTOX_PASSCODE:     ${{ secrets.UPSTOX_PASSCODE }}
+          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+          TEST_MODE:           "false"
+        run: |
+          echo "=== Bot starting at $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+          python Both4withcache9_fixed.py 2>&1 | tee bot_run.log
+          echo "=== Bot finished at $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-log-${{ github.run_id }}
+          path: |
+            bot_run.log
+            r3_live_alerts.csv
+            gap_trading_alerts.csv
+            exits_log.csv
+            positions_tracking.csv
+          retention-days: 7
