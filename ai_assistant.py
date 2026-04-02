@@ -54,8 +54,7 @@ from typing import Optional
 # CONFIGURATION  — edit these two lines
 # ══════════════════════════════════════════════════════════════════════════════
 
-import os as _os
-GROQ_API_KEY   = _os.environ.get("GROQ_API_KEY", "YOUR_GROQ_API_KEY_HERE")   # get free at console.groq.com
+GROQ_API_KEY   = "YOUR_GROQ_API_KEY_HERE"   # get free at console.groq.com
 AI_ENABLED     = True                        # set False to disable entirely
 
 # ── Behaviour knobs ───────────────────────────────────────────────────────────
@@ -76,6 +75,14 @@ AI_EXIT_PROFIT_ONLY      = False     # False = AI can exit losses too (recommend
 AI_LOSS_EXIT_THRESHOLD_PCT = 5.0     # only auto-exit a loss if > 5% down
                                      # set 0.0 to exit at any loss amount
 AI_SILENT_WHEN_NO_POSITIONS = True   # skip API call when nothing is open
+
+# ── Soft AI Exit (profit protection) ─────────────────────────────────────────
+# When PnL crosses AI_TRAIL_TRIGGER_PCT and AI says WATCH, tighten the trail.
+# When PnL crosses AI_FORCE_EXIT_PCT and AI says anything other than HOLD, exit.
+AI_SOFT_EXIT_ENABLED      = True    # master switch for soft exit logic
+AI_TRAIL_TRIGGER_PCT      = 15.0    # % PnL → tighten trail on WATCH
+AI_TRAIL_TIGHT_PCT        = 3.0     # trail % to lock in once triggered (e.g. 3% from peak)
+AI_FORCE_EXIT_PCT         = 25.0    # % PnL → exit if verdict != HOLD
 
 # ── Groq API ──────────────────────────────────────────────────────────────────
 _GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
@@ -484,10 +491,39 @@ def _parse_response(text: str) -> dict:
 # AUTO-EXIT ENFORCER
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _trail_stoploss(symbol: str, pos_id: str, current_price: float,
+                    bot_globals: dict) -> None:
+    """
+    Tighten the trailing stop for a position to AI_TRAIL_TIGHT_PCT from peak.
+    Updates POSITION_PEAK_PRICES so the main bot's trailing-stop logic
+    immediately enforces the tighter trail on the next scan.
+    """
+    peak_prices = bot_globals.get("POSITION_PEAK_PRICES")
+    if peak_prices is None:
+        return
+
+    # Ensure peak is at least current price
+    old_peak = peak_prices.get(pos_id, current_price)
+    new_peak  = max(old_peak, current_price)
+    peak_prices[pos_id] = new_peak
+
+    tight_trail_price = round(new_peak * (1 - AI_TRAIL_TIGHT_PCT / 100), 2)
+    print(
+        f"\n🤖 AI SOFT-TRAIL: {symbol} | PnL >{AI_TRAIL_TRIGGER_PCT}% + WATCH\n"
+        f"   Peak locked at ₹{new_peak:.2f} | "
+        f"Tight trail stop → ₹{tight_trail_price:.2f} "
+        f"({AI_TRAIL_TIGHT_PCT}% below peak)"
+    )
+
+
 def _enforce_exits(parsed: dict, bot_globals: dict, trader) -> None:
     """
     For every position the AI says EXIT, validate the safety conditions
     and call exit_position() if all pass.
+
+    Also implements soft exit logic:
+      • PnL > AI_TRAIL_TRIGGER_PCT + verdict == WATCH  → tighten trailing stop
+      • PnL > AI_FORCE_EXIT_PCT   + verdict != HOLD    → force exit immediately
     """
     if not AI_AUTO_EXIT_ENABLED or trader is None:
         return
@@ -504,6 +540,43 @@ def _enforce_exits(parsed: dict, bot_globals: dict, trader) -> None:
     for pos_id, pos in list(active.items()):
         symbol     = pos.get("symbol", "")
         verdict    = parsed["positions"].get(symbol, {}).get("verdict", "")
+
+        # ── Soft exit logic — profit protection ──────────────────────────────
+        if AI_SOFT_EXIT_ENABLED and exit_fn and get_ltp:
+            option_key    = pos.get("instrument_key", "")
+            _soft_price   = get_ltp(option_key) if option_key else None
+            _entry        = pos.get("entry_price", 0)
+
+            if _soft_price and _entry:
+                _pnl = (_soft_price - _entry) / _entry * 100
+
+                # ── Tier 1: PnL > 15% + WATCH → tighten trailing stop ────────
+                if _pnl > AI_TRAIL_TRIGGER_PCT and verdict == "WATCH":
+                    _trail_stoploss(symbol, pos_id, _soft_price, bot_globals)
+
+                # ── Tier 2: PnL > 25% + not HOLD → exit immediately ──────────
+                if _pnl > AI_FORCE_EXIT_PCT and verdict != "HOLD":
+                    _reason = parsed["positions"].get(symbol, {}).get(
+                        "reason", "AI soft-exit: profit protection"
+                    )
+                    print(
+                        f"\n{'='*70}\n"
+                        f"🤖 AI SOFT-EXIT (profit lock): {symbol}\n"
+                        f"{'='*70}\n"
+                        f"   PnL    : {_pnl:+.1f}% > {AI_FORCE_EXIT_PCT}% threshold\n"
+                        f"   Verdict: {verdict} (not HOLD)\n"
+                        f"   Reason : {_reason}\n"
+                        f"   Price  : ₹{_soft_price:.2f} | Entry: ₹{_entry:.2f}\n"
+                        f"   Calling exit_position() to capture profit...\n"
+                        f"{'='*70}"
+                    )
+                    try:
+                        exit_fn(trader, pos_id, pos, _soft_price,
+                                reason="AI_SOFT_EXIT_PROFIT_LOCK")
+                    except Exception as _e:
+                        print(f"   ⚠️ AI soft-exit error: {_e}")
+                    continue   # position handled — skip strict EXIT gate below
+
         if verdict != "EXIT":
             continue
 
