@@ -1,48 +1,34 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║          REAL-TIME AI TRADING ASSISTANT  —  Groq Free Tier                 ║
-║          Model : llama-3.3-70b-versatile  (free, no credit card)           ║
-║          Runs  : background thread inside Pydroid3                          ║
-║          Cost  : ₹0  (Groq free = 14,400 req/day, 6,000 tokens/min)        ║
+║        REAL-TIME AI TRADING ASSISTANT  —  Dual-Provider Failover            ║
+║                                                                              ║
+║  PRIMARY  : Groq      — llama-3.3-70b-versatile  (free, 14400 req/day)      ║
+║  FALLBACK : NVIDIA    — llama-3.3-70b-instruct   (free, 1000 req/day)       ║
+║                                                                              ║
+║  Automatic failover logic:                                                   ║
+║    • Groq 429 (rate limit)  → switch to NVIDIA immediately                  ║
+║    • Groq 5xx / timeout     → switch to NVIDIA immediately                  ║
+║    • NVIDIA also fails      → skip scan, retry Groq next cycle              ║
+║    • Groq recovers          → switch back automatically after GROQ_RETRY_S  ║
+║                                                                              ║
+║  Cost: ₹0  (both providers are free tier)                                   ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-SETUP (one-time, 2 minutes):
-  1. Go to https://console.groq.com  → sign up free → API Keys → Create key
-  2. Paste the key below as GROQ_API_KEY
-  3. In Pydroid3 terminal:  pip install requests  (already installed in bot)
-  4. The bot imports this file automatically — nothing else to do.
+SETUP (one-time, 5 minutes):
 
-HOW IT WORKS:
-  Every scan (≈30s) the AI receives a snapshot of:
-    • All active positions with live P&L
-    • HA reversal status per position
-    • Recent signals taken / blocked (last 5)
-    • Current Klinger readings for held stocks
-    • HA watchlist (missed signals)
-    • Market conditions summary
+  GROQ (primary):
+    1. Go to https://console.groq.com → sign up → API Keys → Create key
+    2. Paste below as GROQ_API_KEY
+    3. Add as GitHub secret:  GROQ_API_KEY
 
-  The AI then:
-    1. Explains any signal that was taken or blocked this scan
-    2. Warns if a held position looks risky
-    3. Decides autonomously whether to exit a position (CONFIRMED reversal
-       signals only — same threshold as the HA auto-exit logic)
-    4. Prints a plain-language summary you can read at a glance
-
-AUTO-EXIT POLICY:
-  The AI will call exit_position() directly ONLY when ALL 3 are true:
-    a) HA flip confirmed (2 consecutive counter-colour candles)
-    b) Klinger confirms direction (KO falling for LONG, rising for SHORT)
-    c) Position held > AI_MIN_HOLD_MINUTES (default 15 min)
-
-  For LOSING positions: auto-exits when loss > AI_LOSS_EXIT_THRESHOLD_PCT
-    (default 5%) AND reversal is confirmed — cutting a confirmed loss early
-    beats holding through a full reversal.
-  For small losses (< threshold): prints WATCH alert, does not auto-exit.
-
-  Set AI_EXIT_PROFIT_ONLY = True to revert to the old behaviour where
-  the AI never auto-exits a losing position (you handle losses manually).
+  NVIDIA (fallback):
+    1. Go to https://build.nvidia.com → sign in with email
+    2. Search "llama-3.3-70b" → click "Get API Key"
+    3. Paste below as NVIDIA_API_KEY
+    4. Add as GitHub secret:  NVIDIA_API_KEY
 """
 
+import os as _os
 import threading
 import time
 import json
@@ -51,55 +37,62 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION  — edit these two lines
+# CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-GROQ_API_KEY   = "YOUR_GROQ_API_KEY_HERE"   # get free at console.groq.com
-AI_ENABLED     = True                        # set False to disable entirely
+# ── API Keys (read from env on GitHub Actions, fallback to hardcoded) ─────────
+GROQ_API_KEY   = _os.environ.get("GROQ_API_KEY",   "YOUR_GROQ_API_KEY_HERE")
+NVIDIA_API_KEY = _os.environ.get("NVIDIA_API_KEY", "YOUR_NVIDIA_API_KEY_HERE")
+
+AI_ENABLED     = True    # set False to disable entirely
+
+# ── Models ────────────────────────────────────────────────────────────────────
+GROQ_MODEL     = "llama-3.3-70b-versatile"     # best free Groq model
+NVIDIA_MODEL   = "meta/llama-3.3-70b-instruct" # same weights, NVIDIA hosted
 
 # ── Behaviour knobs ───────────────────────────────────────────────────────────
-AI_SCAN_INTERVAL_SECONDS = 35        # slightly offset from 30s bot cycle
-AI_MODEL                 = "llama-3.3-70b-versatile"   # best free Groq model
-AI_MAX_TOKENS            = 400       # keep responses short for mobile screen
-AI_TEMPERATURE           = 0.2       # low = more decisive, less hallucination
-AI_AUTO_EXIT_ENABLED     = True      # let AI exit confirmed reversals
-AI_MIN_HOLD_MINUTES      = 15        # don't auto-exit within first N minutes
-AI_EXIT_PROFIT_ONLY      = False     # False = AI can exit losses too (recommended)
-                                     # True  = AI only exits profitable positions
-                                     #         (you manually handle stop-loss cuts)
-
-# When AI_EXIT_PROFIT_ONLY = False, the AI will still only exit a losing
-# position when BOTH conditions are met:
-#   a) HA flip confirmed + Klinger confirms (same as profit exits)
-#   b) Loss exceeds AI_LOSS_EXIT_THRESHOLD_PCT (prevents exiting on tiny dips)
-AI_LOSS_EXIT_THRESHOLD_PCT = 5.0     # only auto-exit a loss if > 5% down
-                                     # set 0.0 to exit at any loss amount
+AI_SCAN_INTERVAL_SECONDS    = 35     # slightly offset from 30s bot cycle
+AI_MAX_TOKENS               = 400    # keep responses short for mobile screen
+AI_TEMPERATURE              = 0.2    # low = more decisive, less hallucination
+AI_AUTO_EXIT_ENABLED        = True   # let AI exit confirmed reversals
+AI_MIN_HOLD_MINUTES         = 15     # don't auto-exit within first N minutes
+AI_EXIT_PROFIT_ONLY         = False  # False = AI can exit losses too
+AI_LOSS_EXIT_THRESHOLD_PCT  = 5.0    # only auto-exit loss if > 5% down
 AI_SILENT_WHEN_NO_POSITIONS = True   # skip API call when nothing is open
 
 # ── Soft AI Exit (profit protection) ─────────────────────────────────────────
-# When PnL crosses AI_TRAIL_TRIGGER_PCT and AI says WATCH, tighten the trail.
-# When PnL crosses AI_FORCE_EXIT_PCT and AI says anything other than HOLD, exit.
-AI_SOFT_EXIT_ENABLED      = True    # master switch for soft exit logic
-AI_TRAIL_TRIGGER_PCT      = 15.0    # % PnL → tighten trail on WATCH
-AI_TRAIL_TIGHT_PCT        = 3.0     # trail % to lock in once triggered (e.g. 3% from peak)
-AI_FORCE_EXIT_PCT         = 25.0    # % PnL → exit if verdict != HOLD
+AI_SOFT_EXIT_ENABLED   = True
+AI_TRAIL_TRIGGER_PCT   = 15.0   # % PnL → tighten trail on WATCH
+AI_TRAIL_TIGHT_PCT     = 3.0    # trail % to lock in once triggered
+AI_FORCE_EXIT_PCT      = 25.0   # % PnL → exit if verdict != HOLD
 
-# ── Groq API ──────────────────────────────────────────────────────────────────
-_GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
-_GROQ_HEADERS = lambda key: {
-    "Authorization": f"Bearer {key}",
-    "Content-Type":  "application/json",
-}
+# ── Failover settings ─────────────────────────────────────────────────────────
+GROQ_RETRY_SECONDS  = 300   # after switching to NVIDIA, retry Groq after 5 min
+NVIDIA_DAILY_LIMIT  = 950   # NVIDIA free = 1000/day, stop at 950 to stay safe
+GROQ_DAILY_LIMIT    = 14000 # Groq free = 14400/day, stop at 14000 to stay safe
+
+# ── API endpoints ─────────────────────────────────────────────────────────────
+_GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
+_NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 # ── State ─────────────────────────────────────────────────────────────────────
-_ai_thread:       Optional[threading.Thread] = None
-_ai_last_run:     Optional[datetime]         = None
-_ai_call_count:   int                        = 0       # track free-tier usage
-_ai_error_streak: int                        = 0       # back-off on errors
-_AI_LOCK          = threading.Lock()
+_ai_thread:         Optional[threading.Thread] = None
+_ai_last_run:       Optional[datetime]         = None
+_ai_call_count:     int                        = 0   # total calls today
+_groq_call_count:   int                        = 0   # Groq calls today
+_nvidia_call_count: int                        = 0   # NVIDIA calls today
+_ai_error_streak:   int                        = 0
+
+# Failover state
+_using_nvidia:        bool               = False  # currently on fallback?
+_groq_failed_at:      Optional[datetime] = None   # when Groq last failed
+_nvidia_fail_streak:  int                = 0      # NVIDIA consecutive errors
+
+_AI_LOCK = threading.Lock()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SYSTEM PROMPT  — tells the LLM what it's looking at
+# SYSTEM PROMPT
 # ══════════════════════════════════════════════════════════════════════════════
 
 _SYSTEM_PROMPT = """You are a real-time trading assistant for an Upstox F&O bot.
@@ -150,31 +143,21 @@ Rules:
 # MARKET CONTEXT FETCHER  — Nifty/BankNifty + news + earnings (cached 5 min)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_MARKET_CACHE:       dict     = {}
-_MARKET_CACHE_TIME:  datetime = None
-_MARKET_CACHE_TTL             = 300    # seconds between refreshes
+_MARKET_CACHE:        dict              = {}
+_MARKET_CACHE_TIME:   Optional[datetime] = None
+_MARKET_CACHE_TTL                       = 300
 
-_EARNINGS_CACHE:     dict = {}         # symbol → date string
-_EARNINGS_CACHE_DATE: str = ""
+_EARNINGS_CACHE:      dict = {}
+_EARNINGS_CACHE_DATE: str  = ""
 
 
 def _fetch_market_context() -> dict:
-    """
-    Fetch Nifty50 + BankNifty quotes, top ET Markets headlines, and NSE
-    earnings calendar (next 3 days).  All sources are free / no auth.
-    Results are cached for 5 minutes to avoid wasting Groq tokens.
-    Returns an empty dict silently on any failure so the AI still works.
-    """
     global _MARKET_CACHE, _MARKET_CACHE_TIME, _EARNINGS_CACHE, _EARNINGS_CACHE_DATE
     now = datetime.now()
-
     if (_MARKET_CACHE_TIME and
             (now - _MARKET_CACHE_TIME).total_seconds() < _MARKET_CACHE_TTL):
         return _MARKET_CACHE
-
     ctx = {}
-
-    # ── Nifty50 + BankNifty ──────────────────────────────────────────────────
     try:
         sess = _req.Session()
         sess.headers.update({
@@ -182,7 +165,7 @@ def _fetch_market_context() -> dict:
             "Accept":     "application/json",
             "Referer":    "https://www.nseindia.com",
         })
-        sess.get("https://www.nseindia.com", timeout=5)   # prime cookies
+        sess.get("https://www.nseindia.com", timeout=5)
         indices = {}
         for idx_name, key in [("NIFTY 50", "50"), ("NIFTY BANK", "BANK")]:
             try:
@@ -202,261 +185,218 @@ def _fetch_market_context() -> dict:
             except Exception:
                 pass
         if indices:
-            ctx["indices"]    = indices
-            ctx["market_dir"] = indices.get("50", {}).get("dir", "UNKNOWN")
-    except Exception:
-        ctx["market_dir"] = "UNKNOWN"
-
-    # ── ET Markets RSS headlines (top 5, ≤80 chars each) ─────────────────────
-    try:
-        r = _req.get(
-            "https://economictimes.indiatimes.com/markets/rss.cms",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=8,
-        )
-        if r.status_code == 200:
-            import re as _re
-            titles = _re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", r.text)
-            headlines = [t[:80] for t in titles[1:6] if t.strip()]
-            if headlines:
-                ctx["news"] = headlines
+            ctx["indices"] = indices
     except Exception:
         pass
-
-    # ── NSE earnings calendar — next 3 days ──────────────────────────────────
-    today_str = now.strftime("%Y-%m-%d")
-    if _EARNINGS_CACHE_DATE != today_str:
-        try:
-            r = _req.get(
-                "https://www.nseindia.com/api/event-calendar",
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept":     "application/json",
-                    "Referer":    "https://www.nseindia.com",
-                },
-                timeout=10,
-            )
-            if r.status_code == 200:
-                cutoff   = now + timedelta(days=3)
-                earnings = {}
-                for ev in r.json():
-                    purpose = ev.get("purpose", "").lower()
-                    if any(k in purpose for k in ("result", "earnings", "quarterly")):
-                        sym  = ev.get("symbol", "")
-                        date = ev.get("date",   "")
-                        if sym and date:
-                            try:
-                                if now <= datetime.strptime(date, "%d-%b-%Y") <= cutoff:
-                                    earnings[sym] = date
-                            except Exception:
-                                pass
-                _EARNINGS_CACHE      = earnings
-                _EARNINGS_CACHE_DATE = today_str
-        except Exception:
-            pass
-    if _EARNINGS_CACHE:
-        ctx["earnings_3d"] = _EARNINGS_CACHE
-
     _MARKET_CACHE      = ctx
     _MARKET_CACHE_TIME = now
     return ctx
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SNAPSHOT BUILDER  — reads live globals from the main bot
+# SNAPSHOT BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_snapshot(bot_globals: dict) -> dict:
-    """
-    Build a compact, token-efficient snapshot for the AI.
+    active    = bot_globals.get("ACTIVE_POSITIONS", {})
+    watchlist = bot_globals.get("HA_WATCHLIST",     {})
+    mctx      = _fetch_market_context()
 
-    v2 improvements:
-      1. underlying_ltp per position (stock price, not option price)
-      2. Market context: Nifty/BankNifty direction, live levels
-      3. News headlines from ET Markets (top 5, ≤80 chars each)
-      4. Earnings warning flag (True if stock reports within 3 days)
-      5. Log lines truncated to 100 chars (saves ~30% tokens)
-      6. Watchlist reasons truncated to 80 chars
-      7. Klinger field renamed/compressed (ko + hist only, signal dropped)
-      8. Position id removed (not needed by AI), field names shortened
-    """
-    now = datetime.now()
-
-    # ── Market context (fetched + cached every 5 min) ─────────────────────────
-    mctx     = _fetch_market_context()
-    earnings = mctx.get("earnings_3d", {})
-
-    # ── Helpers for underlying LTP lookup ─────────────────────────────────────
-    live_data   = bot_globals.get("_LIVE_DATA",      {})
-    sym_to_isin = bot_globals.get("SYMBOL_TO_ISIN",  {})
-    r3_levels   = bot_globals.get("R3_LEVELS",       {})
-
-    def _ultp(symbol: str, underlying_key: str) -> float:
-        ikey = underlying_key or sym_to_isin.get(symbol, "")
-        if ikey and ikey in live_data:
-            return round(live_data[ikey].get("ltp", 0), 2)
-        if ikey and ikey in r3_levels:
-            return round(r3_levels[ikey].get("ltp", 0), 2)
-        return 0
-
-    # ── Active positions ──────────────────────────────────────────────────────
-    active_raw = bot_globals.get("ACTIVE_POSITIONS", {})
-    ha_alerted = bot_globals.get("_HA_ALERTED", set())
-    positions  = []
-
-    for pos_id, pos in active_raw.items():
-        symbol         = pos.get("symbol", "?")
-        signal         = pos.get("fast_trade_signal", pos.get("breakout_type", "?"))
-        entry          = pos.get("entry_price", 0)
-        entry_time     = pos.get("timestamp", now)
-        held_mins      = round((now - entry_time).total_seconds() / 60, 1) if entry_time else 0
-        underlying_key = pos.get("underlying_key", "")
-        option_key     = pos.get("instrument_key", "")
-
-        opt_ltp = bot_globals.get("_LAST_LTP", {}).get(option_key, 0)
-        pnl_pct = round((opt_ltp - entry) / entry * 100, 2) if entry and opt_ltp else None
-        u_ltp   = _ultp(symbol, underlying_key)
-
-        # Klinger — just KO value and 3-bar history (enough for trend direction)
-        kl = {}
-        if underlying_key in r3_levels:
-            kd = r3_levels[underlying_key].get("klinger", {})
-            if kd:
-                kl = {
-                    "ko":   round(kd.get("klinger", 0), 0),
-                    "hist": [round(v, 0) for v in kd.get("ko_history", [])[-3:]],
-                }
-
-        positions.append({
-            "sym":       symbol,
-            "dir":       signal,
-            "entry":     entry,
-            "opt_ltp":   opt_ltp or "?",
-            "u_ltp":     u_ltp   or "?",     # ← underlying stock price (new)
-            "pnl%":      pnl_pct,
-            "held_min":  held_mins,
-            "ha_flip":   f"{pos_id}_flip" in ha_alerted,
-            "ha_doji":   f"{pos_id}_doji" in ha_alerted,
-            "kl":        kl,
-            "strat":     pos.get("strategy", "?"),
-            "earn_warn": symbol in earnings,   # ← earnings within 3 days (new)
-        })
-
-    # ── HA watchlist — reasons truncated ─────────────────────────────────────
-    watchlist = [
-        {
-            "sym":     sym,
-            "sig":     w.get("signal", "?"),
-            "reason":  w.get("reason", "")[:80],
-            "age_min": round((now - w.get("added_at", now)).total_seconds() / 60, 1),
+    positions = {}
+    for pid, pos in active.items():
+        sym    = pos.get("symbol", "")
+        entry  = pos.get("entry_price", 0)
+        ikey   = pos.get("instrument_key", "")
+        ukey   = pos.get("underlying_key",  "")
+        held   = round((datetime.now() - pos.get("timestamp", datetime.now())
+                        ).total_seconds() / 60, 1)
+        positions[sym] = {
+            "direction":  pos.get("direction", ""),
+            "entry":      entry,
+            "held_min":   held,
+            "strategy":   pos.get("strategy", ""),
         }
-        for sym, w in bot_globals.get("HA_WATCHLIST", {}).items()
-    ]
 
-    # ── Recent log — 8 lines, each ≤100 chars ────────────────────────────────
-    recent_log = []
-    try:
-        with open(bot_globals.get("ALERT_LOG_FILE", "r3_live_alerts.txt"),
-                  "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        recent_log = [l.strip()[:100] for l in lines[-12:] if l.strip()][-8:]
-    except Exception:
-        pass
+    recent_log = bot_globals.get("_AI_RECENT_LOG", [])
+    orders     = bot_globals.get("GAP_ORDER_COUNT", 0) + \
+                 bot_globals.get("BREAKOUT_ORDER_COUNT", 0)
 
-    # ── Order stats ───────────────────────────────────────────────────────────
-    orders = sum(bot_globals.get(k, 0) for k in [
-        "DAILY_ORDER_COUNT", "BOX_ORDER_COUNT", "RANGE_ORDER_COUNT",
-        "GAP_ORDER_COUNT", "FAST_TRADE_ORDER_COUNT", "ORB_ORDER_COUNT",
-    ])
-
-    # ── Final snapshot ────────────────────────────────────────────────────────
     snap = {
-        "time":      now.strftime("%H:%M"),
-        "market": {                                  # ← market context (new)
-            "dir":    mctx.get("market_dir", "UNKNOWN"),
-            "nifty":  mctx.get("indices", {}).get("50",   {}),
-            "banknf": mctx.get("indices", {}).get("BANK", {}),
-        },
+        "time":      datetime.now().strftime("%H:%M:%S"),
+        "market":    mctx.get("indices", {}),
         "positions": positions,
-        "watchlist": watchlist,
+        "watchlist": {k: v.get("signal", "") for k, v in watchlist.items()},
         "pnl":       round(bot_globals.get("DAILY_PNL", 0), 2),
         "orders":    f"{orders}/{bot_globals.get('MAX_ORDERS_PER_DAY', 10)}",
         "stopped":   bot_globals.get("TRADING_STOPPED", False),
         "log":       recent_log,
     }
-    # News only added when non-empty (omitted on quiet days to save tokens)
     if mctx.get("news"):
-        snap["news"] = mctx["news"]              # ← top 5 ET Markets headlines (new)
-
+        snap["news"] = mctx["news"]
     return snap
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GROQ API CALL
+# PROVIDER ROUTER  — Groq primary, NVIDIA fallback
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _call_groq(snapshot: dict) -> Optional[str]:
-    """Send snapshot to Groq, return AI response text or None on error."""
-    global _ai_call_count, _ai_error_streak
-
-    if GROQ_API_KEY == "YOUR_GROQ_API_KEY_HERE" or not GROQ_API_KEY:
-        return None
-
-    user_msg = f"Current bot snapshot:\n{json.dumps(snapshot, indent=2, default=str)}"
-
-    payload = {
-        "model":       AI_MODEL,
+def _build_payload(model: str, snapshot: dict) -> dict:
+    """Build the common OpenAI-compatible payload for either provider."""
+    return {
+        "model":       model,
         "messages":    [
-            {"role": "system",  "content": _SYSTEM_PROMPT},
-            {"role": "user",    "content": user_msg},
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user",   "content":
+                f"Current bot snapshot:\n{json.dumps(snapshot, indent=2, default=str)}"},
         ],
         "max_tokens":  AI_MAX_TOKENS,
         "temperature": AI_TEMPERATURE,
     }
 
+
+def _call_groq(snapshot: dict) -> Optional[str]:
+    """Call Groq API. Returns response text, or None on any failure."""
+    global _groq_call_count, _ai_error_streak, _using_nvidia, _groq_failed_at
+
+    if not GROQ_API_KEY or GROQ_API_KEY == "YOUR_GROQ_API_KEY_HERE":
+        return None
+    if _groq_call_count >= GROQ_DAILY_LIMIT:
+        print(f"\n⚠️  AI: Groq daily limit ({GROQ_DAILY_LIMIT}) reached — switching to NVIDIA")
+        _using_nvidia   = True
+        _groq_failed_at = datetime.now()
+        return None
+
     try:
         resp = _req.post(
             _GROQ_URL,
-            headers=_GROQ_HEADERS(GROQ_API_KEY),
-            json=payload,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                     "Content-Type":  "application/json"},
+            json=_build_payload(GROQ_MODEL, snapshot),
             timeout=20,
         )
         if resp.status_code == 200:
-            _ai_call_count   += 1
+            _groq_call_count += 1
             _ai_error_streak  = 0
+            _using_nvidia     = False   # Groq working — stay on primary
             return resp.json()["choices"][0]["message"]["content"].strip()
+
         elif resp.status_code == 429:
-            print("\n⚠️  AI: Groq rate limit hit — skipping this scan")
+            print("\n⚠️  AI: Groq rate-limited (429) — switching to NVIDIA fallback")
+            _using_nvidia   = True
+            _groq_failed_at = datetime.now()
             _ai_error_streak += 1
             return None
+
         else:
+            print(f"\n⚠️  AI: Groq error {resp.status_code} — switching to NVIDIA fallback")
+            _using_nvidia   = True
+            _groq_failed_at = datetime.now()
             _ai_error_streak += 1
-            if _ai_error_streak <= 2:
-                print(f"\n⚠️  AI: Groq error {resp.status_code} — {resp.text[:120]}")
             return None
+
     except Exception as e:
+        print(f"\n⚠️  AI: Groq request failed ({e}) — switching to NVIDIA fallback")
+        _using_nvidia   = True
+        _groq_failed_at = datetime.now()
         _ai_error_streak += 1
-        if _ai_error_streak <= 2:
-            print(f"\n⚠️  AI: Request failed — {e}")
         return None
 
 
+def _call_nvidia(snapshot: dict) -> Optional[str]:
+    """Call NVIDIA NIM API (safety fallback). Returns response text or None."""
+    global _nvidia_call_count, _nvidia_fail_streak
+
+    if not NVIDIA_API_KEY or NVIDIA_API_KEY == "YOUR_NVIDIA_API_KEY_HERE":
+        print("\n⚠️  AI: NVIDIA_API_KEY not set — cannot use fallback.")
+        print("      Get free key at https://build.nvidia.com")
+        return None
+    if _nvidia_call_count >= NVIDIA_DAILY_LIMIT:
+        print(f"\n⚠️  AI: NVIDIA daily limit ({NVIDIA_DAILY_LIMIT}) reached — both providers exhausted")
+        return None
+
+    try:
+        resp = _req.post(
+            _NVIDIA_URL,
+            headers={"Authorization": f"Bearer {NVIDIA_API_KEY}",
+                     "Content-Type":  "application/json"},
+            json=_build_payload(NVIDIA_MODEL, snapshot),
+            timeout=25,
+        )
+        if resp.status_code == 200:
+            _nvidia_call_count  += 1
+            _nvidia_fail_streak  = 0
+            return resp.json()["choices"][0]["message"]["content"].strip()
+
+        elif resp.status_code == 429:
+            print(f"\n⚠️  AI: NVIDIA also rate-limited (429) — skipping scan")
+            _nvidia_fail_streak += 1
+            return None
+
+        else:
+            print(f"\n⚠️  AI: NVIDIA error {resp.status_code} — skipping scan")
+            _nvidia_fail_streak += 1
+            return None
+
+    except Exception as e:
+        print(f"\n⚠️  AI: NVIDIA request failed ({e}) — skipping scan")
+        _nvidia_fail_streak += 1
+        return None
+
+
+def _call_ai(snapshot: dict) -> Optional[str]:
+    """
+    Main router — tries Groq first, falls back to NVIDIA automatically.
+    Also retries Groq after GROQ_RETRY_SECONDS if it previously failed.
+    """
+    global _using_nvidia, _groq_failed_at, _ai_call_count
+
+    # ── Try to restore Groq if it failed a while ago ──────────────────────────
+    if _using_nvidia and _groq_failed_at:
+        secs_since_fail = (datetime.now() - _groq_failed_at).total_seconds()
+        if secs_since_fail >= GROQ_RETRY_SECONDS:
+            print(f"\n🔄 AI: {GROQ_RETRY_SECONDS}s elapsed — retrying Groq (primary)")
+            _using_nvidia = False
+
+    # ── Route to correct provider ─────────────────────────────────────────────
+    if not _using_nvidia:
+        result = _call_groq(snapshot)
+        if result:
+            _ai_call_count += 1
+            return result
+        # Groq failed → try NVIDIA this scan
+        if _using_nvidia:
+            result = _call_nvidia(snapshot)
+            if result:
+                _ai_call_count += 1
+                provider_label = "NVIDIA (fallback)"
+                print(f"   ↳ Response from {provider_label}")
+            return result
+    else:
+        # Already on NVIDIA
+        result = _call_nvidia(snapshot)
+        if result:
+            _ai_call_count += 1
+        return result
+
+    return None
+
+
+def _provider_status() -> str:
+    """One-line string showing current provider and call counts."""
+    if _using_nvidia:
+        return (f"NVIDIA fallback | Groq: {_groq_call_count}/{GROQ_DAILY_LIMIT} | "
+                f"NVIDIA: {_nvidia_call_count}/{NVIDIA_DAILY_LIMIT}")
+    return (f"Groq primary | Groq: {_groq_call_count}/{GROQ_DAILY_LIMIT} | "
+            f"NVIDIA: {_nvidia_call_count}/{NVIDIA_DAILY_LIMIT} (standby)")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# RESPONSE PARSER  — extracts EXIT decisions for auto-action
+# RESPONSE PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_response(text: str) -> dict:
-    """
-    Parse AI response into structured dict.
-    Returns:
-      { 'summary': str,
-        'positions': { symbol: {'verdict': 'HOLD'|'WATCH'|'EXIT', 'reason': str} },
-        'watchlist':  { symbol: {'verdict': 'ALERT'|'OK', 'reason': str} },
-        'raw': str }
-    """
-    result = {"summary": "", "positions": {}, "watchlist": {}, "raw": text}
+    result  = {"summary": "", "positions": {}, "watchlist": {}, "raw": text}
     section = None
-
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -470,7 +410,6 @@ def _parse_response(text: str) -> dict:
         elif line == "END":
             section = None
         elif section in ("positions", "watchlist") and ":" in line:
-            # Format: "  SYMBOL: VERDICT — reason"
             sym_part, _, rest = line.lstrip().partition(":")
             sym_part = sym_part.strip().upper()
             rest     = rest.strip()
@@ -483,7 +422,6 @@ def _parse_response(text: str) -> dict:
                     break
             if sym_part:
                 result[section][sym_part] = {"verdict": verdict, "reason": reason}
-
     return result
 
 
@@ -493,20 +431,12 @@ def _parse_response(text: str) -> dict:
 
 def _trail_stoploss(symbol: str, pos_id: str, current_price: float,
                     bot_globals: dict) -> None:
-    """
-    Tighten the trailing stop for a position to AI_TRAIL_TIGHT_PCT from peak.
-    Updates POSITION_PEAK_PRICES so the main bot's trailing-stop logic
-    immediately enforces the tighter trail on the next scan.
-    """
     peak_prices = bot_globals.get("POSITION_PEAK_PRICES")
     if peak_prices is None:
         return
-
-    # Ensure peak is at least current price
     old_peak = peak_prices.get(pos_id, current_price)
     new_peak  = max(old_peak, current_price)
     peak_prices[pos_id] = new_peak
-
     tight_trail_price = round(new_peak * (1 - AI_TRAIL_TIGHT_PCT / 100), 2)
     print(
         f"\n🤖 AI SOFT-TRAIL: {symbol} | PnL >{AI_TRAIL_TRIGGER_PCT}% + WATCH\n"
@@ -517,44 +447,28 @@ def _trail_stoploss(symbol: str, pos_id: str, current_price: float,
 
 
 def _enforce_exits(parsed: dict, bot_globals: dict, trader) -> None:
-    """
-    For every position the AI says EXIT, validate the safety conditions
-    and call exit_position() if all pass.
-
-    Also implements soft exit logic:
-      • PnL > AI_TRAIL_TRIGGER_PCT + verdict == WATCH  → tighten trailing stop
-      • PnL > AI_FORCE_EXIT_PCT   + verdict != HOLD    → force exit immediately
-    """
     if not AI_AUTO_EXIT_ENABLED or trader is None:
         return
-
-    active    = bot_globals.get("ACTIVE_POSITIONS", {})
-    exit_fn   = bot_globals.get("exit_position")
-    get_ltp   = getattr(trader, "get_ltp", None)
-
+    active  = bot_globals.get("ACTIVE_POSITIONS", {})
+    exit_fn = bot_globals.get("exit_position")
+    get_ltp = getattr(trader, "get_ltp", None)
     if not exit_fn or not get_ltp:
         return
-
     now = datetime.now()
 
     for pos_id, pos in list(active.items()):
-        symbol     = pos.get("symbol", "")
-        verdict    = parsed["positions"].get(symbol, {}).get("verdict", "")
+        symbol  = pos.get("symbol", "")
+        verdict = parsed["positions"].get(symbol, {}).get("verdict", "")
 
-        # ── Soft exit logic — profit protection ──────────────────────────────
+        # ── Soft exit ──────────────────────────────────────────────────────────
         if AI_SOFT_EXIT_ENABLED and exit_fn and get_ltp:
-            option_key    = pos.get("instrument_key", "")
-            _soft_price   = get_ltp(option_key) if option_key else None
-            _entry        = pos.get("entry_price", 0)
-
+            option_key  = pos.get("instrument_key", "")
+            _soft_price = get_ltp(option_key) if option_key else None
+            _entry      = pos.get("entry_price", 0)
             if _soft_price and _entry:
                 _pnl = (_soft_price - _entry) / _entry * 100
-
-                # ── Tier 1: PnL > 15% + WATCH → tighten trailing stop ────────
                 if _pnl > AI_TRAIL_TRIGGER_PCT and verdict == "WATCH":
                     _trail_stoploss(symbol, pos_id, _soft_price, bot_globals)
-
-                # ── Tier 2: PnL > 25% + not HOLD → exit immediately ──────────
                 if _pnl > AI_FORCE_EXIT_PCT and verdict != "HOLD":
                     _reason = parsed["positions"].get(symbol, {}).get(
                         "reason", "AI soft-exit: profit protection"
@@ -564,10 +478,9 @@ def _enforce_exits(parsed: dict, bot_globals: dict, trader) -> None:
                         f"🤖 AI SOFT-EXIT (profit lock): {symbol}\n"
                         f"{'='*70}\n"
                         f"   PnL    : {_pnl:+.1f}% > {AI_FORCE_EXIT_PCT}% threshold\n"
-                        f"   Verdict: {verdict} (not HOLD)\n"
+                        f"   Verdict: {verdict}\n"
                         f"   Reason : {_reason}\n"
                         f"   Price  : ₹{_soft_price:.2f} | Entry: ₹{_entry:.2f}\n"
-                        f"   Calling exit_position() to capture profit...\n"
                         f"{'='*70}"
                     )
                     try:
@@ -575,52 +488,41 @@ def _enforce_exits(parsed: dict, bot_globals: dict, trader) -> None:
                                 reason="AI_SOFT_EXIT_PROFIT_LOCK")
                     except Exception as _e:
                         print(f"   ⚠️ AI soft-exit error: {_e}")
-                    continue   # position handled — skip strict EXIT gate below
+                    continue
 
         if verdict != "EXIT":
             continue
 
-        # ── Safety gate 1: minimum hold time ─────────────────────────────────
+        # ── Safety gate 1: minimum hold time ──────────────────────────────────
         entry_time = pos.get("timestamp", now)
         held_mins  = (now - entry_time).total_seconds() / 60 if entry_time else 0
         if held_mins < AI_MIN_HOLD_MINUTES:
-            print(f"\n🤖 AI: EXIT recommended for {symbol} but held only "
-                  f"{held_mins:.1f}min < {AI_MIN_HOLD_MINUTES}min minimum — skipping auto-exit")
+            print(f"\n🤖 AI: EXIT for {symbol} but held only "
+                  f"{held_mins:.1f}min < {AI_MIN_HOLD_MINUTES}min — skipping")
             continue
 
-        # ── Safety gate 2: loss threshold check ──────────────────────────────
+        # ── Safety gate 2: loss threshold ─────────────────────────────────────
         option_key    = pos.get("instrument_key", "")
         current_price = get_ltp(option_key) if option_key else None
         entry         = pos.get("entry_price", 0)
-
         if current_price and entry:
             pnl_pct = (current_price - entry) / entry * 100
             is_loss = pnl_pct < 0
-
             if is_loss:
                 if AI_EXIT_PROFIT_ONLY:
-                    # Hard block — user handles losses manually
-                    reason = parsed["positions"][symbol].get("reason", "")
-                    print(f"\n🤖 AI: EXIT recommended for {symbol} but position is in LOSS "
-                          f"({pnl_pct:.1f}%) and AI_EXIT_PROFIT_ONLY=True — alerting only.\n"
-                          f"   AI reason: {reason}\n"
-                          f"   ⚠️  Consider exiting manually if you agree.")
+                    print(f"\n🤖 AI: EXIT for {symbol} blocked — loss "
+                          f"({pnl_pct:.1f}%) + AI_EXIT_PROFIT_ONLY=True")
                     continue
                 elif abs(pnl_pct) < AI_LOSS_EXIT_THRESHOLD_PCT:
-                    # Loss too small to act on — could be noise
-                    print(f"\n🤖 AI: EXIT for {symbol} — loss only {pnl_pct:.1f}% "
-                          f"(threshold {AI_LOSS_EXIT_THRESHOLD_PCT}%) — waiting for bigger move")
+                    print(f"\n🤖 AI: EXIT for {symbol} — loss {pnl_pct:.1f}% "
+                          f"< threshold {AI_LOSS_EXIT_THRESHOLD_PCT}% — waiting")
                     continue
-                else:
-                    # Loss is large enough + reversal confirmed — auto-exit
-                    print(f"\n🤖 AI: Loss exit triggered for {symbol} "
-                          f"({pnl_pct:.1f}% < -{AI_LOSS_EXIT_THRESHOLD_PCT}%) + reversal confirmed")
 
         if not current_price:
-            print(f"\n🤖 AI: EXIT for {symbol} — could not fetch LTP, skipping auto-exit")
+            print(f"\n🤖 AI: EXIT for {symbol} — could not fetch LTP, skipping")
             continue
 
-        # ── All gates passed — auto-exit ──────────────────────────────────────
+        # ── All gates passed — auto-exit ───────────────────────────────────────
         reason_text = parsed["positions"][symbol].get("reason", "AI reversal signal")
         pnl_pct     = (current_price - entry) / entry * 100 if entry else 0
         pnl_icon    = "📈" if pnl_pct >= 0 else "📉"
@@ -632,7 +534,6 @@ def _enforce_exits(parsed: dict, bot_globals: dict, trader) -> None:
             f"   Price  : ₹{current_price:.2f} | Entry: ₹{entry:.2f} | "
             f"{pnl_icon} P&L: {pnl_pct:+.1f}%\n"
             f"   Held   : {held_mins:.1f}min\n"
-            f"   Calling exit_position() now...\n"
             f"{'='*70}"
         )
         try:
@@ -642,19 +543,17 @@ def _enforce_exits(parsed: dict, bot_globals: dict, trader) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PRINT FORMATTED AI OUTPUT
+# PRINT FORMATTED OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _print_ai_response(parsed: dict, call_num: int) -> None:
-    """Print AI response in a readable format inline with bot output."""
-    now = datetime.now().strftime("%H:%M:%S")
+    now      = datetime.now().strftime("%H:%M:%S")
+    provider = "NVIDIA" if _using_nvidia else "Groq"
     print(f"\n{'─'*70}")
-    print(f"🤖 AI ASSISTANT  [{now}]  (call #{call_num})")
+    print(f"🤖 AI ASSISTANT  [{now}]  (call #{call_num})  [{provider}]")
     print(f"{'─'*70}")
-
     if parsed["summary"]:
         print(f"📋 {parsed['summary']}")
-
     if parsed["positions"]:
         print("\n📊 POSITIONS:")
         for sym, info in parsed["positions"].items():
@@ -662,7 +561,6 @@ def _print_ai_response(parsed: dict, call_num: int) -> None:
             reason  = info.get("reason", "")
             icon    = {"HOLD": "✅", "WATCH": "⚠️ ", "EXIT": "🚨"}.get(verdict, "❓")
             print(f"   {icon} {sym}: {verdict} — {reason}")
-
     if parsed["watchlist"]:
         print("\n👁️  WATCHLIST:")
         for sym, info in parsed["watchlist"].items():
@@ -670,65 +568,54 @@ def _print_ai_response(parsed: dict, call_num: int) -> None:
             reason  = info.get("reason", "")
             icon    = {"ALERT": "🔔", "OK": "✅"}.get(verdict, "❓")
             print(f"   {icon} {sym}: {verdict} — {reason}")
-
+    print(f"   📡 Provider: {_provider_status()}")
     print(f"{'─'*70}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN LOOP  — runs as a daemon thread
+# MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ai_loop(bot_globals_fn, trader_fn) -> None:
-    """
-    Main AI loop. Runs forever as a daemon thread.
-
-    Args:
-      bot_globals_fn : callable that returns the bot module's globals() dict
-      trader_fn      : callable that returns the current UpstoxTrader instance
-                       (or None if not yet created)
-    """
     global _ai_last_run, _ai_error_streak
 
-    print("\n🤖 AI Assistant started (Groq / llama-3.3-70b)")
+    print("\n🤖 AI Assistant started — Dual provider (Groq + NVIDIA fallback)")
+    print(f"   Groq model    : {GROQ_MODEL}")
+    print(f"   NVIDIA model  : {NVIDIA_MODEL}")
     print(f"   Scan interval : {AI_SCAN_INTERVAL_SECONDS}s")
     print(f"   Auto-exit     : {'ENABLED' if AI_AUTO_EXIT_ENABLED else 'DISABLED'}")
-    print(f"   Exit profit-only: {AI_EXIT_PROFIT_ONLY}")
-    if GROQ_API_KEY == "YOUR_GROQ_API_KEY_HERE":
-        print("   ⚠️  GROQ_API_KEY not set — AI assistant will not call the API.")
-        print("      Get a free key at https://console.groq.com")
+    print(f"   Groq retry    : every {GROQ_RETRY_SECONDS}s after failure")
 
-    # Stagger start — let the bot initialise for 90s first
-    time.sleep(90)
+    groq_ok   = GROQ_API_KEY   not in ("YOUR_GROQ_API_KEY_HERE",   "", None)
+    nvidia_ok = NVIDIA_API_KEY not in ("YOUR_NVIDIA_API_KEY_HERE", "", None)
+    print(f"   Groq key      : {'✅ set' if groq_ok   else '❌ NOT SET — get at console.groq.com'}")
+    print(f"   NVIDIA key    : {'✅ set' if nvidia_ok else '⚠️  not set — fallback disabled'}")
+
+    time.sleep(90)   # let bot initialise first
 
     while True:
         try:
-            # ── Back-off on repeated errors ───────────────────────────────────
             if _ai_error_streak >= 5:
                 wait = min(300, _ai_error_streak * 30)
-                print(f"\n⚠️  AI: {_ai_error_streak} consecutive errors — waiting {wait}s")
+                print(f"\n⚠️  AI: {_ai_error_streak} errors — waiting {wait}s")
                 time.sleep(wait)
                 _ai_error_streak = 0
 
-            bg = bot_globals_fn()
+            bg     = bot_globals_fn()
             trader = trader_fn()
 
-            # ── Skip if nothing is open and silent mode is on ─────────────────
             active = bg.get("ACTIVE_POSITIONS", {})
-            wl     = bg.get("HA_WATCHLIST", {})
+            wl     = bg.get("HA_WATCHLIST",     {})
             if AI_SILENT_WHEN_NO_POSITIONS and not active and not wl:
                 time.sleep(AI_SCAN_INTERVAL_SECONDS)
                 continue
 
-            # ── Build snapshot ────────────────────────────────────────────────
             snapshot = _build_snapshot(bg)
+            raw      = _call_ai(snapshot)
 
-            # ── Call Groq ─────────────────────────────────────────────────────
-            raw = _call_groq(snapshot)
             if raw:
                 parsed = _parse_response(raw)
                 _print_ai_response(parsed, _ai_call_count)
-
-                # ── Auto-exit if warranted ────────────────────────────────────
                 if active:
                     _enforce_exits(parsed, bg, trader)
 
@@ -742,32 +629,17 @@ def _ai_loop(bot_globals_fn, trader_fn) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PUBLIC API  — called from the main bot
+# PUBLIC API
 # ══════════════════════════════════════════════════════════════════════════════
 
 def start_ai_assistant(bot_globals_fn, trader_fn) -> None:
-    """
-    Start the AI assistant as a background daemon thread.
-
-    Call this once from enhanced_monitor() AFTER the trader is created:
-
-        from ai_assistant import start_ai_assistant
-        start_ai_assistant(lambda: globals(), lambda: trader)
-
-    Args:
-      bot_globals_fn : zero-arg callable returning globals() of the bot module
-      trader_fn      : zero-arg callable returning the UpstoxTrader instance
-    """
     global _ai_thread
-
     if not AI_ENABLED:
         print("🤖 AI Assistant: disabled (AI_ENABLED=False)")
         return
-
     if _ai_thread and _ai_thread.is_alive():
         print("🤖 AI Assistant: already running")
         return
-
     _ai_thread = threading.Thread(
         target=_ai_loop,
         args=(bot_globals_fn, trader_fn),
@@ -778,13 +650,13 @@ def start_ai_assistant(bot_globals_fn, trader_fn) -> None:
 
 
 def ai_status() -> str:
-    """Return a one-line status string for the bot's startup banner."""
-    if not AI_ENABLED:
-        return "AI Assistant: DISABLED"
-    key_ok = GROQ_API_KEY != "YOUR_GROQ_API_KEY_HERE" and GROQ_API_KEY
+    groq_ok   = GROQ_API_KEY   not in ("YOUR_GROQ_API_KEY_HERE",   "", None)
+    nvidia_ok = NVIDIA_API_KEY not in ("YOUR_NVIDIA_API_KEY_HERE", "", None)
+    provider  = "NVIDIA(fallback)" if _using_nvidia else "Groq(primary)"
     return (
-        f"AI Assistant: {'ACTIVE ✓' if key_ok else 'KEY MISSING ⚠️'} | "
-        f"Model: {AI_MODEL} | "
-        f"Auto-exit: {'ON' if AI_AUTO_EXIT_ENABLED else 'OFF'} | "
-        f"Calls so far: {_ai_call_count}"
+        f"AI Assistant: {'ACTIVE ✓' if (groq_ok or nvidia_ok) else 'KEYS MISSING ⚠️'} | "
+        f"Provider: {provider} | "
+        f"Calls: {_ai_call_count} "
+        f"(Groq:{_groq_call_count} NVIDIA:{_nvidia_call_count}) | "
+        f"Auto-exit: {'ON' if AI_AUTO_EXIT_ENABLED else 'OFF'}"
     )
