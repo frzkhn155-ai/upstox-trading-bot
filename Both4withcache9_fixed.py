@@ -149,7 +149,7 @@ BYPASS_MARKET_CHECKS = TEST_MODE      # used in is_market_open / is_market_stabi
 # When TEST_MODE=True and the bot starts before 05:30 IST, wait until the
 # Upstox order window opens rather than running and generating rejected orders.
 # Set False to scan immediately without waiting (signals logged, orders blocked).
-WAIT_FOR_ORDER_WINDOW = True
+WAIT_FOR_ORDER_WINDOW = False
 
 # EXIT STRATEGY CONFIGURATION
 ENABLE_EXIT_MANAGEMENT = True
