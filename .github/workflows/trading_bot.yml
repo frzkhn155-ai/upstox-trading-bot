@@ -2,14 +2,20 @@ name: Trading Bot
 
 on:
   schedule:
+    # IST = UTC + 5:30
+    # Job 1: start at 09:00 IST = 03:30 UTC  (15 min before market open)
+    # Starts early so initialization (162 stocks + cache) finishes before 09:15
     - cron: '30 3 * * 1-5'
+
+    # Job 2: 12:00 PM IST = 06:30 UTC  (afternoon session)
     - cron: '30 6 * * 1-5'
-  workflow_dispatch:
+
+  workflow_dispatch:   # manual trigger button
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 359
+    timeout-minutes: 359   # 5h 59m — just under GitHub's 6h hard limit
 
     steps:
       - name: Checkout
@@ -24,6 +30,52 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # ── Set IST timezone on the runner ──────────────────────────────────────
+      # GitHub runners are UTC. Setting TZ=Asia/Kolkata makes date/shell
+      # commands show IST, but the Python fix (now_ist()) handles it in code.
+      - name: Set timezone to IST
+        run: |
+          sudo timedatectl set-timezone Asia/Kolkata
+          echo "Runner time: $(date)"
+          echo "TZ=Asia/Kolkata" >> $GITHUB_ENV
+
+      # ── Restore candle cache ─────────────────────────────────────────────────
+      - name: Set cache week key
+        run: echo "CACHE_WEEK=$(date +'%Y-W%V')" >> $GITHUB_ENV
+
+      - name: Restore candle cache
+        uses: actions/cache@v4
+        with:
+          path: candle_cache/
+          key: candle-cache-${{ runner.os }}-${{ env.CACHE_WEEK }}
+          restore-keys: |
+            candle-cache-${{ runner.os }}-
+
+      # ── Wait until 09:14 IST before starting bot ────────────────────────────
+      # Job starts at 09:00 IST. Initialization takes ~8 min (162 stocks).
+      # This sleep ensures we finish init and are ready exactly at 09:15 open.
+      # Skipped for Job 2 (12:00 PM) and manual runs — only needed at 09:00.
+      - name: Wait for market open (09:00 start only)
+        run: |
+          CURRENT_HOUR=$(TZ=Asia/Kolkata date +%H)
+          CURRENT_MIN=$(TZ=Asia/Kolkata date +%M)
+          echo "Current IST time: $(TZ=Asia/Kolkata date)"
+          if [ "$CURRENT_HOUR" = "09" ] && [ "$CURRENT_MIN" -lt "14" ]; then
+            TARGET=$(TZ=Asia/Kolkata date -d "today 09:14" +%s 2>/dev/null || \
+                     python3 -c "from datetime import datetime; from zoneinfo import ZoneInfo; \
+                     import time; ist=ZoneInfo('Asia/Kolkata'); \
+                     t=datetime.now(ist).replace(hour=9,minute=14,second=0,microsecond=0); \
+                     print(int(t.timestamp()))")
+            NOW=$(date +%s)
+            WAIT=$((TARGET - NOW))
+            if [ "$WAIT" -gt 0 ]; then
+              echo "Waiting ${WAIT}s until 09:14 IST for initialization to complete..."
+              sleep $WAIT
+            fi
+          else
+            echo "Not the 09:00 job or already past 09:14 — starting immediately"
+          fi
+
       - name: Run trading bot
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
@@ -34,11 +86,21 @@ jobs:
           UPSTOX_MOBILE:       ${{ secrets.UPSTOX_MOBILE }}
           UPSTOX_PASSCODE:     ${{ secrets.UPSTOX_PASSCODE }}
           GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+          NVIDIA_API_KEY:      ${{ secrets.NVIDIA_API_KEY }}
           TEST_MODE:           "false"
+          TRADE_MODE:          "intraday"
+          TZ:                  "Asia/Kolkata"
         run: |
-          echo "=== Bot starting at $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+          echo "=== Bot starting at $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST') ==="
           python Both4withcache9_fixed.py 2>&1 | tee bot_run.log
-          echo "=== Bot finished at $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+          echo "=== Bot finished at $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST') ==="
+
+      - name: Save candle cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: candle_cache/
+          key: candle-cache-${{ runner.os }}-${{ env.CACHE_WEEK }}
 
       - name: Upload run log
         if: always()
