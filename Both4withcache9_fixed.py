@@ -108,7 +108,7 @@ VOLUME_SPIKE_THRESHOLD = 1.3
 VOLUME_LOOKBACK_DAYS = 20
 USE_DYNAMIC_VOLUME_THRESHOLD = True
 MAX_WORKERS = 3
-DEBUG_MODE = False                     # <-- changed to True
+DEBUG_MODE = False                     # set True for verbose logs
 BATCH_SIZE = 100
 MAX_INSTRUMENTS_PER_BATCH = 500
 
@@ -175,7 +175,7 @@ ENABLE_STRATEGY_EXITS = True
 POSITION_MONITORING_INTERVAL = 30
 
 # GAP TRADING CONFIGURATION
-ENABLE_GAP_TRADING = False    # disabled — ORB+Topping only mode
+ENABLE_GAP_TRADING = True
 GAP_THRESHOLD_PERCENT = 1.5   # raised from 1.0 — filters weak gaps like SUZLON(-1.4%)
 GAP_FILL_THRESHOLD = 0.3
 MAX_GAP_PERCENT = 5.0
@@ -186,7 +186,7 @@ GAP_MIN_VOLUME_RATIO = 1.2
 GAP_FILL_EXIT_PERCENT = 80
 
 # BOX THEORY CONFIGURATION
-ENABLE_BOX_TRADING = False    # disabled — ORB+Topping only mode
+ENABLE_BOX_TRADING = True
 BOX_CONFIRMATION_CYCLES = 2
 BOX_VOLUME_THRESHOLD_MULTIPLIER = 1.0
 BOX_REENTRY_EXIT_PERCENT = 0.5
@@ -198,7 +198,7 @@ MAX_ENTRY_DISTANCE_PERCENT = 1.5  # Skip CE if price > 1.5% above box top at con
                                    # Skip PE if price > 1.5% below box bottom at confirmation
 
 # RANGE TRADING CONFIGURATION
-ENABLE_RANGE_TRADING = False  # disabled — ORB+Topping only mode
+ENABLE_RANGE_TRADING = True
 RANGE_BOUNCE_THRESHOLD = 0.5
 BOUNCE_VOLUME_MULTIPLIER = 1.2
 
@@ -299,7 +299,7 @@ EARLY_REVERSAL_BAND_TOL_PCT      = 0.5    # candle HIGH within 0.5% below upper 
 # When True: fast-trade loop runs ONLY topping reversal signals.
 # All Bollinger LONG / SHORT squeeze signals are suppressed.
 # Set False to re-enable full fast-trade scanning.
-TOPPING_REVERSAL_ONLY = True   # ← ORB + Topping only mode
+TOPPING_REVERSAL_ONLY = False   # all strategies enabled
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ========== FII/DII + ORB CONFIGURATION ==========
