@@ -2,78 +2,40 @@ name: Trading Bot
 
 on:
   schedule:
-    # All times in UTC (IST = UTC + 5:30)
-
-    # ── Job 0: Pre-market data download ─────────────────────────────────────
-    # 09:00 IST = 02:30 UTC  — downloads historical candles, FII/DII data,
-    # option chain snapshots BEFORE market opens. Warms the cache so the
-    # trading session starts instantly at 09:15.
-    - cron: '30 2 * * 1-5'
-
-    # ── Job 1: Morning trading session ──────────────────────────────────────
-    # 09:00 IST = 03:30 UTC  — 15 min early so init finishes before 09:15.
+    # 9:00 AM IST (03:30 UTC)
     - cron: '30 3 * * 1-5'
+    
+    # 2:50 PM IST (09:20 UTC) - UPDATED 
+    - cron: '20 9 * * 1-5'
+    
+  workflow_dispatch:
 
-    # ── Job 2: Afternoon trading session ────────────────────────────────────
-    # 12:00 PM IST = 06:30 UTC
-    - cron: '30 6 * * 1-5'
-
-  workflow_dispatch:   # manual trigger button in GitHub UI
-
-# ── Shared environment variables ────────────────────────────────────────────
-env:
-  TZ: Asia/Kolkata
-  PYTHON_VERSION: '3.11'
+# ── Grant the workflow write access so it can push the cache back ──────────────
+permissions:
+  contents: write
 
 jobs:
-
-  # ══════════════════════════════════════════════════════════════════════════
-  # JOB 0 — PRE-MARKET DATA DOWNLOAD  (08:00 IST = 02:30 UTC)
-  # Downloads and caches all data needed before market opens:
-  #   • Historical OHLCV candles for all 162 stocks
-  #   • FII/DII data
-  #   • Option chain snapshot
-  #   • Gap analysis (yesterday close vs today pre-open)
-  # The trading jobs (Job 1 & 2) restore this cache and skip re-downloading.
-  # ══════════════════════════════════════════════════════════════════════════
-  pre-market-download:
-    name: Pre-Market Data Download (08:00 IST)
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 359
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Use the default GITHUB_TOKEN (write permissions granted above)
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Set IST timezone on runner
-        run: |
-          sudo timedatectl set-timezone Asia/Kolkata
-          echo "Runner IST time: $(date)"
-          echo "TZ=Asia/Kolkata" >> $GITHUB_ENV
-
-      - name: Set cache week key
-        run: echo "CACHE_WEEK=$(date +'%Y-W%V')" >> $GITHUB_ENV
-
-      # Restore any existing cache from previous days
-      - name: Restore candle cache
-        uses: actions/cache@v4
-        with:
-          path: candle_cache/
-          key: candle-cache-${{ runner.os }}-${{ env.CACHE_WEEK }}
-          restore-keys: |
-            candle-cache-${{ runner.os }}-
-
-      # Run bot in PRE_MARKET_MODE — only downloads data, does NOT trade
-      - name: Run pre-market data download
+      - name: Run trading bot
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           UPSTOX_API_KEY:      ${{ secrets.UPSTOX_API_KEY }}
@@ -83,211 +45,38 @@ jobs:
           UPSTOX_MOBILE:       ${{ secrets.UPSTOX_MOBILE }}
           UPSTOX_PASSCODE:     ${{ secrets.UPSTOX_PASSCODE }}
           GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
-          NVIDIA_API_KEY:      ${{ secrets.NVIDIA_API_KEY }}
           TEST_MODE:           "false"
-          TRADE_MODE:          "options"
-          PRE_MARKET_MODE:     "true"
-          TZ:                  "Asia/Kolkata"
         run: |
-          echo "=== Pre-market download starting at $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST') ==="
-          python Both4withcache9_fixed.py 2>&1 | tee premarket_run.log
-          echo "=== Pre-market download finished at $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST') ==="
+          echo "=== Bot starting at $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+          python Both4withcache9_fIxed.py 2>&1 | tee bot_run.log
+          echo "=== Bot finished at $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
 
-      # Save freshly downloaded cache so trading jobs can use it
-      - name: Save candle cache
+      # ── Option B: commit candle_cache/ back to the repository ─────────────
+      - name: Commit candle cache to repository
         if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: candle_cache/
-          key: candle-cache-${{ runner.os }}-${{ env.CACHE_WEEK }}
-
-      - name: Upload pre-market log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: premarket-log-${{ github.run_id }}
-          path: premarket_run.log
-          retention-days: 7
-
-
-  # ══════════════════════════════════════════════════════════════════════════
-  # JOB 1 — MORNING TRADING SESSION  (09:00 IST = 03:30 UTC)
-  # Covers 09:15 AM → ~12:00 PM IST
-  # Waits until 09:14 IST so initialization completes exactly at open.
-  # ══════════════════════════════════════════════════════════════════════════
-  run-bot-morning:
-    name: Morning Session (09:15-12:00 IST)
-    runs-on: ubuntu-latest
-    timeout-minutes: 180   # 3 hours — covers 09:15 to 12:15 IST
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Set IST timezone on runner
         run: |
-          sudo timedatectl set-timezone Asia/Kolkata
-          echo "Runner IST time: $(date)"
-          echo "TZ=Asia/Kolkata" >> $GITHUB_ENV
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Set cache week key
-        run: echo "CACHE_WEEK=$(date +'%Y-W%V')" >> $GITHUB_ENV
+          git add candle_cache/ cache_stats.json 2>/dev/null || true
 
-      # Restore cache warmed by pre-market job
-      - name: Restore candle cache
-        uses: actions/cache@v4
-        with:
-          path: candle_cache/
-          key: candle-cache-${{ runner.os }}-${{ env.CACHE_WEEK }}
-          restore-keys: |
-            candle-cache-${{ runner.os }}-
-
-      # Wait until 09:14 IST so bot finishes init exactly at market open 09:15
-      - name: Wait for market open (09:14 IST)
-        run: |
-          CURRENT_HOUR=$(TZ=Asia/Kolkata date +%H)
-          CURRENT_MIN=$(TZ=Asia/Kolkata date +%M)
-          echo "Current IST time: $(TZ=Asia/Kolkata date)"
-          if [ "$CURRENT_HOUR" = "09" ] && [ "$CURRENT_MIN" -lt "14" ]; then
-            TARGET=$(python3 -c "
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-          ist = ZoneInfo('Asia/Kolkata')
-          t = datetime.now(ist).replace(hour=9, minute=14, second=0, microsecond=0)
-          print(int(t.timestamp()))
-          ")
-            NOW=$(date +%s)
-            WAIT=$((TARGET - NOW))
-            if [ "$WAIT" -gt 0 ]; then
-              echo "Waiting ${WAIT}s until 09:14 IST..."
-              sleep $WAIT
-            fi
+          if git diff --cached --quiet; then
+            echo "✅ Candle cache unchanged — nothing to commit."
           else
-            echo "Already past 09:14 IST — starting immediately"
+            TIMESTAMP=$(date '+%Y-%m-%d %H:%M UTC')
+            git commit -m "chore: update candle_cache [$TIMESTAMP]"
+            git push
+            echo "✅ Candle cache committed and pushed."
           fi
+      # ──────────────────────────────────────────────────────────────────────
 
-      - name: Run trading bot (morning session)
-        env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-          UPSTOX_API_KEY:      ${{ secrets.UPSTOX_API_KEY }}
-          UPSTOX_API_SECRET:   ${{ secrets.UPSTOX_API_SECRET }}
-          UPSTOX_EMAIL:        ${{ secrets.UPSTOX_EMAIL }}
-          UPSTOX_EMAIL_PWD:    ${{ secrets.UPSTOX_EMAIL_PWD }}
-          UPSTOX_MOBILE:       ${{ secrets.UPSTOX_MOBILE }}
-          UPSTOX_PASSCODE:     ${{ secrets.UPSTOX_PASSCODE }}
-          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
-          NVIDIA_API_KEY:      ${{ secrets.NVIDIA_API_KEY }}
-          TEST_MODE:           "false"
-          TRADE_MODE:          "options"
-          TZ:                  "Asia/Kolkata"
-        run: |
-          echo "=== Morning session starting at $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST') ==="
-          python Both4withcache9_fixed.py 2>&1 | tee bot_morning.log
-          echo "=== Morning session finished at $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST') ==="
-
-      - name: Save candle cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: candle_cache/
-          key: candle-cache-${{ runner.os }}-${{ env.CACHE_WEEK }}
-
-      - name: Upload morning log
+      - name: Upload run log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bot-morning-${{ github.run_id }}
+          name: bot-log-${{ github.run_id }}
           path: |
-            bot_morning.log
-            r3_live_alerts.csv
-            gap_trading_alerts.csv
-            exits_log.csv
-            positions_tracking.csv
-          retention-days: 7
-
-
-  # ══════════════════════════════════════════════════════════════════════════
-  # JOB 2 — AFTERNOON TRADING SESSION  (12:00 PM IST = 06:30 UTC)
-  # Covers 12:00 PM to 03:30 PM IST (market close)
-  # timeout-minutes = 210 = 3h 30m to cover till 15:30 IST exactly.
-  # ══════════════════════════════════════════════════════════════════════════
-  run-bot-afternoon:
-    name: Afternoon Session (12:00-15:30 IST)
-    runs-on: ubuntu-latest
-    timeout-minutes: 210   # 3.5 hours — covers 12:00 to 15:30 IST
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Set IST timezone on runner
-        run: |
-          sudo timedatectl set-timezone Asia/Kolkata
-          echo "Runner IST time: $(date)"
-          echo "TZ=Asia/Kolkata" >> $GITHUB_ENV
-
-      - name: Set cache week key
-        run: echo "CACHE_WEEK=$(date +'%Y-W%V')" >> $GITHUB_ENV
-
-      - name: Restore candle cache
-        uses: actions/cache@v4
-        with:
-          path: candle_cache/
-          key: candle-cache-${{ runner.os }}-${{ env.CACHE_WEEK }}
-          restore-keys: |
-            candle-cache-${{ runner.os }}-
-
-      - name: Run trading bot (afternoon session)
-        env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-          UPSTOX_API_KEY:      ${{ secrets.UPSTOX_API_KEY }}
-          UPSTOX_API_SECRET:   ${{ secrets.UPSTOX_API_SECRET }}
-          UPSTOX_EMAIL:        ${{ secrets.UPSTOX_EMAIL }}
-          UPSTOX_EMAIL_PWD:    ${{ secrets.UPSTOX_EMAIL_PWD }}
-          UPSTOX_MOBILE:       ${{ secrets.UPSTOX_MOBILE }}
-          UPSTOX_PASSCODE:     ${{ secrets.UPSTOX_PASSCODE }}
-          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
-          NVIDIA_API_KEY:      ${{ secrets.NVIDIA_API_KEY }}
-          TEST_MODE:           "false"
-          TRADE_MODE:          "options"
-          TZ:                  "Asia/Kolkata"
-        run: |
-          echo "=== Afternoon session starting at $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST') ==="
-          python Both4withcache9_fixed.py 2>&1 | tee bot_afternoon.log
-          echo "=== Afternoon session finished at $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST') ==="
-
-      - name: Save candle cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: candle_cache/
-          key: candle-cache-${{ runner.os }}-${{ env.CACHE_WEEK }}
-
-      - name: Upload afternoon log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-afternoon-${{ github.run_id }}
-          path: |
-            bot_afternoon.log
+            bot_run.log
             r3_live_alerts.csv
             gap_trading_alerts.csv
             exits_log.csv
