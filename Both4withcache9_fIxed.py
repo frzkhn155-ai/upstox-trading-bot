@@ -2316,17 +2316,21 @@ def is_market_open():
     return MARKET_OPEN_TIME <= current_time <= MARKET_CLOSE_TIME
 
 def is_market_stabilized():
-    # FIX 4: Bypass check if TEST_MODE is enabled
     if BYPASS_MARKET_CHECKS:
         return True
-    now = datetime.now(IST)
-    if now.weekday() >= 5:
-        return False
-    current_time = now.strftime("%H:%M")
-    if current_time < MARKET_OPEN_TIME or current_time >= MARKET_CLOSE_TIME:
-        return False
-    market_open_dt = datetime.strptime(MARKET_OPEN_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
+
+    now = datetime.now(IST)  # aware
+
+    today_str = now.strftime("%Y-%m-%d")
+    # Parse as naive, then localize to IST
+    market_open_dt = datetime.strptime(
+        today_str + " " + MARKET_OPEN_TIME, "%Y-%m-%d %H:%M"
+    ).replace(tzinfo=IST)
+
     minutes_since_open = (now - market_open_dt).total_seconds() / 60
+
+    if minutes_since_open < 0:
+        return False
     return minutes_since_open >= MARKET_STABILIZATION_MINUTES
 
 def is_exit_time():
