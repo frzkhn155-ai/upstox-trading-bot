@@ -61,6 +61,7 @@ sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 # On GitHub Actions these are injected as repository secrets (Settings → Secrets).
 # For local Pydroid3 use, hardcode them below as fallback.
 import os as _os
+
 EMAIL          = _os.environ.get("UPSTOX_EMAIL",    "frzkhn155@gmail.com")
 EMAIL_PASSWORD = _os.environ.get("UPSTOX_EMAIL_PWD","vdeahogzvpsmfirv")
 MOBILE_NUMBER  = _os.environ.get("UPSTOX_MOBILE",  "7397408750")
@@ -2333,17 +2334,13 @@ def is_market_stabilized():
         return False
     return minutes_since_open >= MARKET_STABILIZATION_MINUTES
 
-def is_exit_time():
-    """Check if it's time to start exiting positions"""
-    now = datetime.now(IST)
-    current_time = now.strftime("%H:%M")
-    return current_time >= EXIT_START_TIME
-
 def is_gap_trading_window(now=None):
     """Check if current time is within gap trading window"""
     if now is None:
         now = datetime.now(IST)
-    market_open = datetime.strptime(MARKET_OPEN_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
+    market_open = datetime.strptime(MARKET_OPEN_TIME, "%H:%M").replace(
+        year=now.year, month=now.month, day=now.day, tzinfo=IST
+    )
     minutes_since_open = (now - market_open).total_seconds() / 60
     return GAP_ENTRY_DELAY_MINUTES <= minutes_since_open <= GAP_TRADING_WINDOW_MINUTES
 
@@ -2351,7 +2348,9 @@ def dynamic_volume_threshold():
     if not USE_DYNAMIC_VOLUME_THRESHOLD:
         return VOLUME_SPIKE_THRESHOLD
     now = datetime.now(IST)
-    market_open_dt = datetime.strptime(MARKET_OPEN_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
+    market_open_dt = datetime.strptime(MARKET_OPEN_TIME, "%H:%M").replace(
+        year=now.year, month=now.month, day=now.day, tzinfo=IST
+    )
     minutes_since_open = (now - market_open_dt).total_seconds() / 60
     if minutes_since_open < 60:
         return 1.2
