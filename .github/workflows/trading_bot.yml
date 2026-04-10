@@ -2,12 +2,9 @@ name: Trading Bot
 
 on:
   schedule:
-    # 9:00 AM IST (03:30 UTC)
-    - cron: '30 3 * * 1-5'
-    
-    # 2:50 PM IST (09:20 UTC) - UPDATED 
-    - cron: '20 9 * * 1-5'
-    
+    - cron: '30 3 * * 1-5'      # 9:00 AM IST
+    - cron: '20 9 * * 1-5'      # 2:50 PM IST
+    - cron: '47 16 * * 1-5'     # 10:17 PM IST (16:47 UTC)    
   workflow_dispatch:
 
 # ── Grant the workflow write access so it can push the cache back ──────────────
