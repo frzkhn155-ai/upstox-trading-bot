@@ -6,7 +6,6 @@ import imaplib
 import email
 import re
 import json
-import pyperclip
 import requests
 import pandas as pd
 import csv
@@ -23,16 +22,39 @@ except ImportError:
     def ai_status(): return "AI Assistant: ai_assistant.py not found"
 # ─────────────────────────────────────────────────────────────────────────────
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo as _ZoneInfo
+
+_IST = _ZoneInfo("Asia/Kolkata")
+
+def now_ist() -> datetime:
+    """Return current datetime in IST (Asia/Kolkata).
+    On GitHub Actions the server is UTC — this ensures all market-hours
+    checks, timestamps, and log lines use the correct Indian time."""
+    return datetime.now(_IST).replace(tzinfo=None)
 from email.utils import parsedate_to_datetime
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    _SELENIUM_AVAILABLE = True
+except ImportError:
+    _SELENIUM_AVAILABLE = False
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+except ImportError:
+    ChromeDriverManager = None
+try:
+    from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+except ImportError:
+    class TimeoutException(Exception): pass
+    class ElementClickInterceptedException(Exception): pass
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from bs4 import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 # ============ FORCE UNBUFFERED OUTPUT (fixes Pydroid3 display freeze) ============
 sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line-buffered
@@ -86,7 +108,7 @@ VOLUME_SPIKE_THRESHOLD = 1.3
 VOLUME_LOOKBACK_DAYS = 20
 USE_DYNAMIC_VOLUME_THRESHOLD = True
 MAX_WORKERS = 3
-DEBUG_MODE = True                     # <-- changed to True
+DEBUG_MODE = False                     # <-- changed to True
 BATCH_SIZE = 100
 MAX_INSTRUMENTS_PER_BATCH = 500
 
@@ -108,12 +130,26 @@ FAST_TRADE_EXIT_FILE = "fast_trades_exits.csv"
 # AUTOMATED TRADING CONFIGURATION
 ENABLE_AUTO_TRADING = True
 ORDER_QUANTITY = 1
-ORDER_PRODUCT = 'D'                   # <-- changed from 'I' to 'D' (NRML for options)
+ORDER_PRODUCT = 'D'                   # NRML for options (overridden for intraday)
 PLACE_STOPLOSS = True
 STOPLOSS_PERCENTAGE = 15.0
 MAX_ORDERS_PER_DAY = 10
 MIN_ORDER_GAP_SECONDS = 300
 ORDER_VERIFICATION_DELAY = 3
+
+# ── TRADE MODE ────────────────────────────────────────────────────────────────
+# "options"  — buy CE/PE options (current behaviour, requires F&O margin)
+# "intraday" — buy/sell the underlying stock directly with MIS product
+#              LONG signal → BUY stock, SHORT signal → SELL stock (short-selling)
+#              All positions auto-squared-off at 3:20 PM by Upstox MIS policy
+# Set via env var TRADE_MODE=intraday on GitHub Actions, or hardcode below.
+TRADE_MODE = _os.environ.get("TRADE_MODE", "options").lower()  # "options" or "intraday"
+
+# Intraday-specific settings (used only when TRADE_MODE = "intraday")
+INTRADAY_QUANTITY   = 1      # shares per trade (increase once profitable)
+INTRADAY_SL_PERCENT = 0.5    # stop-loss % from entry (0.5% = tight intraday SL)
+INTRADAY_TGT_PERCENT= 1.0    # target % from entry (1:2 risk-reward)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # TEST MODE — set env var TEST_MODE=false on GitHub Actions for live trading
 TEST_MODE = _os.environ.get("TEST_MODE", "true").lower() not in ("false", "0", "no")
@@ -139,18 +175,18 @@ ENABLE_STRATEGY_EXITS = True
 POSITION_MONITORING_INTERVAL = 30
 
 # GAP TRADING CONFIGURATION
-ENABLE_GAP_TRADING = True
-GAP_THRESHOLD_PERCENT = 1.0
+ENABLE_GAP_TRADING = False    # disabled — ORB+Topping only mode
+GAP_THRESHOLD_PERCENT = 1.5   # raised from 1.0 — filters weak gaps like SUZLON(-1.4%)
 GAP_FILL_THRESHOLD = 0.3
 MAX_GAP_PERCENT = 5.0
-GAP_ENTRY_DELAY_MINUTES = 5
+GAP_ENTRY_DELAY_MINUTES = 15  # raised from 5 — wait 15 min to avoid opening spike SL
 GAP_TRADING_WINDOW_MINUTES = 45
 GAP_POSITION_SIZE_MULTIPLIER = 1.0
 GAP_MIN_VOLUME_RATIO = 1.2
 GAP_FILL_EXIT_PERCENT = 80
 
 # BOX THEORY CONFIGURATION
-ENABLE_BOX_TRADING = True
+ENABLE_BOX_TRADING = False    # disabled — ORB+Topping only mode
 BOX_CONFIRMATION_CYCLES = 2
 BOX_VOLUME_THRESHOLD_MULTIPLIER = 1.0
 BOX_REENTRY_EXIT_PERCENT = 0.5
@@ -162,7 +198,7 @@ MAX_ENTRY_DISTANCE_PERCENT = 1.5  # Skip CE if price > 1.5% above box top at con
                                    # Skip PE if price > 1.5% below box bottom at confirmation
 
 # RANGE TRADING CONFIGURATION
-ENABLE_RANGE_TRADING = True
+ENABLE_RANGE_TRADING = False  # disabled — ORB+Topping only mode
 RANGE_BOUNCE_THRESHOLD = 0.5
 BOUNCE_VOLUME_MULTIPLIER = 1.2
 
@@ -259,6 +295,11 @@ EARLY_REVERSAL_RSI_LONG          = 37     # RSI <= this for early LONG (oversold
 EARLY_REVERSAL_VOLUME_RATIO      = 1.5    # stricter vol spike (normal = 1.2–1.3)
 EARLY_REVERSAL_BODY_MAX_PCT      = 0.45   # body/range < 45% → Doji / exhaustion candle
 EARLY_REVERSAL_BAND_TOL_PCT      = 0.5    # candle HIGH within 0.5% below upper band
+
+# When True: fast-trade loop runs ONLY topping reversal signals.
+# All Bollinger LONG / SHORT squeeze signals are suppressed.
+# Set False to re-enable full fast-trade scanning.
+TOPPING_REVERSAL_ONLY = True   # ← ORB + Topping only mode
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ========== FII/DII + ORB CONFIGURATION ==========
@@ -1171,8 +1212,8 @@ class UpstoxLogin:
             data = {
                 'timestamp': datetime.now().isoformat(),
                 'token': token,
-                'date': datetime.now().strftime('%Y-%m-%d'),
-                'time': datetime.now().strftime('%H:%M:%S')
+                'date': now_ist().strftime('%Y-%m-%d'),
+                'time': now_ist().strftime('%H:%M:%S')
             }
             with open(TOKEN_TIMESTAMP_FILE, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -1754,7 +1795,11 @@ class UpstoxLogin:
                                 parent = copy_btn.find_element(By.XPATH, "./..")
                                 parent.click()
                             time.sleep(1)
-                            token = pyperclip.paste()
+                            try:
+                                import pyperclip as _pc
+                                token = _pc.paste()
+                            except Exception:
+                                token = ""
                             if token and len(token) > 100 and token.startswith('eyJ'):
                                 print(f"✅ JWT Access Token found: {token[:20]}...")
                                 return token
@@ -2261,20 +2306,20 @@ def is_order_time_allowed():
     because it is an exchange-level restriction, not a market-hours restriction.
     Trying outside this window returns HTTP 423 (UDAPI100074).
     """
-    now = datetime.now()
+    now = now_ist()
     order_start = now.replace(hour=5, minute=30, second=0, microsecond=0)
     order_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
     allowed = order_start <= now <= order_end
     if not allowed:
         print(f"⏰ Order blocked: Upstox API only accepts orders 05:30–23:59 IST "
-              f"(current time {now.strftime('%H:%M:%S')})")
+              f"(current IST time {now.strftime('%H:%M:%S')})")
     return allowed
 
 def is_market_open():
     # FIX 4: Bypass check if TEST_MODE is enabled
     if BYPASS_MARKET_CHECKS:
         return True
-    now = datetime.now()
+    now = now_ist()
     if now.weekday() >= 5:
         return False
     current_time = now.strftime("%H:%M")
@@ -2284,7 +2329,7 @@ def is_market_stabilized():
     # FIX 4: Bypass check if TEST_MODE is enabled
     if BYPASS_MARKET_CHECKS:
         return True
-    now = datetime.now()
+    now = now_ist()
     if now.weekday() >= 5:
         return False
     current_time = now.strftime("%H:%M")
@@ -2296,14 +2341,14 @@ def is_market_stabilized():
 
 def is_exit_time():
     """Check if it's time to start exiting positions"""
-    now = datetime.now()
+    now = now_ist()
     current_time = now.strftime("%H:%M")
     return current_time >= EXIT_START_TIME
 
 def is_gap_trading_window(now=None):
     """Check if current time is within gap trading window"""
     if now is None:
-        now = datetime.now()
+        now = now_ist()
     market_open = datetime.strptime(MARKET_OPEN_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
     minutes_since_open = (now - market_open).total_seconds() / 60
     return GAP_ENTRY_DELAY_MINUTES <= minutes_since_open <= GAP_TRADING_WINDOW_MINUTES
@@ -2311,7 +2356,7 @@ def is_gap_trading_window(now=None):
 def dynamic_volume_threshold():
     if not USE_DYNAMIC_VOLUME_THRESHOLD:
         return VOLUME_SPIKE_THRESHOLD
-    now = datetime.now()
+    now = now_ist()
     market_open_dt = datetime.strptime(MARKET_OPEN_TIME, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
     minutes_since_open = (now - market_open_dt).total_seconds() / 60
     if minutes_since_open < 60:
@@ -2531,7 +2576,7 @@ def extract_fii_dii_data():
                 if not symbol:
                     continue
                 stock = {
-                    'Date': datetime.now().strftime('%Y-%m-%d'),
+                    'Date': now_ist().strftime('%Y-%m-%d'),
                     'Symbol': symbol,
                     'Stock_Name': name,
                     'FII_DII_Cash': cols[1].get_text(strip=True),
@@ -2543,7 +2588,7 @@ def extract_fii_dii_data():
         if not stocks:
             return load_fii_dii_from_cache()
         df = pd.DataFrame(stocks)
-        filename = f"FII_DII_{datetime.now().strftime('%Y%m%d')}.csv"
+        filename = f"FII_DII_{now_ist().strftime('%Y%m%d')}.csv"
         df.to_csv(filename, index=False)
         FII_DII_DATA = {row['Symbol']: row for _, row in df.iterrows()}
         FII_DII_LAST_UPDATE = datetime.now()
@@ -2985,7 +3030,7 @@ def process_first_candles(access_token, live_data, late_pass=False):
     else:
         if not ORB_LATE_CHECKED:
             return                        # nothing left to retry — skip immediately
-        print(f"\n🔄 ORB late-volume pass ({datetime.now().strftime('%H:%M')}) — "
+        print(f"\n🔄 ORB late-volume pass ({now_ist().strftime('%H:%M')}) — "
               f"retrying {len(ORB_LATE_CHECKED)} zero-volume symbols from 09:20")
 
     orb_count = 0
@@ -3056,7 +3101,7 @@ def check_orb_breakout(symbol, current_price, current_volume, live_data):
     if symbol not in ORB_SIGNALS or symbol in ORB_ALERTED_STOCKS:
         return None
     orb = ORB_SIGNALS[symbol]
-    now = datetime.now()
+    now = now_ist()
     market_open_920 = now.replace(hour=9, minute=20, second=0, microsecond=0)
     minutes_since_920 = (now - market_open_920).total_seconds() / 60
     if minutes_since_920 < 0 or minutes_since_920 > ORB_BREAKOUT_WINDOW_MINUTES:
@@ -3134,7 +3179,7 @@ def log_orb_signal(signal):
         with open(ORB_SIGNALS_FILE, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
                 signal['symbol'],
                 signal['signal_type'],
                 signal['direction'],
@@ -3154,7 +3199,7 @@ def log_orb_trade(trade, action='ENTRY'):
         with open(ORB_TRADES_FILE, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
                 trade['symbol'],
                 action,
                 trade['direction'],
@@ -3196,7 +3241,7 @@ def send_orb_alert(signal, trader=None):
     log_orb_trade(signal, 'ENTRY')
     with open(ORB_LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"\n{'='*100}\n")
-        f.write(f"ORB ALERT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"ORB ALERT: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Symbol: {signal['symbol']}\n")
         f.write(f"Signal: {signal['signal']} ({signal['direction']})\n")
         f.write(f"Confidence: {signal['confidence']} | FII/DII: {signal['fii_dii_signal']}\n")
@@ -3207,7 +3252,7 @@ def send_orb_alert(signal, trader=None):
         with open(ALERT_CSV_FILE, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                now_ist().strftime('%Y-%m-%d %H:%M:%S'),
                 signal['symbol'],
                 f"ORB_{signal['direction']}",
                 signal['entry_price'],
@@ -3279,7 +3324,7 @@ def check_orb_time_and_process(access_token, live_data):
     global ORB_PROCESSED_TODAY, ORB_LATE_CHECKED
     if not ENABLE_ORB_STRATEGY:
         return
-    now          = datetime.now()
+    now          = now_ist()
     current_time = now.strftime("%H:%M")
     market_920   = now.replace(hour=9, minute=20, second=0, microsecond=0)
     cutoff       = market_920 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
@@ -4818,7 +4863,7 @@ def manage_fast_trade_exit(trade, current_price, df, klinger_data=None):
 def get_cached_option_chain(trader, underlying_key):
     """Get option chain with caching to reduce API calls"""
     cache_key = underlying_key
-    current_time = datetime.now()
+    current_time = now_ist()
     
     # Check if valid cache exists
     if cache_key in OPTION_CHAIN_CACHE:
@@ -5048,9 +5093,155 @@ def get_available_margin(trader):
             return None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# INTRADAY EQUITY ORDER  — used when TRADE_MODE = "intraday"
+# Buys/sells the underlying stock directly (MIS product, auto-SQ-OFF 3:20 PM)
+# instead of buying an option contract.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def place_intraday_equity_order(signal_type, trader, symbol, instrument_key,
+                                 current_price, strategy_tag="INTRADAY"):
+    """
+    Place an intraday equity BUY (LONG) or SELL (SHORT) order.
+
+    Args:
+      signal_type   : 'LONG' or 'SHORT'
+      trader        : UpstoxTrader instance
+      symbol        : stock symbol (e.g. 'RELIANCE')
+      instrument_key: NSE_EQ instrument key
+      current_price : current LTP of the stock
+      strategy_tag  : label for position record (e.g. 'GAP', 'ORB', 'FAST')
+    """
+    global LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED
+
+    if TRADING_STOPPED:
+        print("⚠️ Trading stopped — no new orders")
+        return None
+
+    if not is_order_time_allowed():
+        print(f"⏭️  {symbol} INTRADAY: skipped — outside order window")
+        return None
+
+    if symbol in LAST_ORDER_TIME:
+        secs = (datetime.now() - LAST_ORDER_TIME[symbol]).total_seconds()
+        if secs < MIN_ORDER_GAP_SECONDS:
+            print(f"⏭️  {symbol}: too soon since last order ({secs:.0f}s < {MIN_ORDER_GAP_SECONDS}s)")
+            return None
+
+    transaction = 'BUY' if signal_type == 'LONG' else 'SELL'
+    qty         = INTRADAY_QUANTITY
+
+    # Compute SL and target prices
+    if signal_type == 'LONG':
+        sl_price  = round(current_price * (1 - INTRADAY_SL_PERCENT  / 100), 2)
+        tgt_price = round(current_price * (1 + INTRADAY_TGT_PERCENT / 100), 2)
+    else:
+        sl_price  = round(current_price * (1 + INTRADAY_SL_PERCENT  / 100), 2)
+        tgt_price = round(current_price * (1 - INTRADAY_TGT_PERCENT / 100), 2)
+
+    # Margin check — MIS intraday requires ~20-25% of trade value
+    estimated_cost = current_price * qty * 0.25
+    available = get_available_margin(trader)
+    if available is not None and available < estimated_cost:
+        print(f"⚠️ {symbol} INTRADAY: insufficient margin "
+              f"(need ~₹{estimated_cost:.0f}, have ₹{available:.0f}) — skipping")
+        return None
+
+    limit_price = round(current_price * (1.001 if signal_type == 'LONG' else 0.999), 2)
+
+    print(f"\n{'='*70}")
+    print(f"📈 INTRADAY EQUITY ORDER: {symbol}")
+    print(f"{'='*70}")
+    print(f" Signal    : {signal_type} ({transaction})")
+    print(f" Strategy  : {strategy_tag}")
+    print(f" Qty       : {qty} shares")
+    print(f" Entry     : ₹{current_price:.2f} → Limit ₹{limit_price:.2f}")
+    print(f" Stop-Loss : ₹{sl_price:.2f}  ({INTRADAY_SL_PERCENT}%)")
+    print(f" Target    : ₹{tgt_price:.2f}  ({INTRADAY_TGT_PERCENT}%)")
+    print(f" Product   : MIS (auto-SQ-OFF 3:20 PM)")
+
+    try:
+        result = trader.place_order(
+            instrument_key=instrument_key,
+            quantity=qty,
+            transaction_type=transaction,
+            product='I',          # MIS = intraday
+            order_type='LIMIT',
+            price=limit_price,
+        )
+
+        order_info = verify_order_result(trader, result, symbol)
+        if order_info and order_info.get('order_id'):
+            order_id    = order_info['order_id']
+            filled_price = order_info.get('filled_price', current_price)
+
+            LAST_ORDER_TIME[symbol] = datetime.now()
+
+            position_record = {
+                'order_id':       order_id,
+                'symbol':         symbol,
+                'option_symbol':  symbol,          # equity symbol = same
+                'instrument_key': instrument_key,
+                'underlying_key': instrument_key,
+                'entry_price':    filled_price,
+                'quantity':       qty,
+                'trade_type':     'INTRADAY_EQ',
+                'direction':      signal_type,
+                'timestamp':      datetime.now(),
+                'strategy':       strategy_tag,
+                'sl_price':       sl_price,
+                'target_price':   tgt_price,
+                'is_premium_estimated': False,
+            }
+            PLACED_ORDERS[order_id] = position_record
+            if order_info.get('status') == 'complete':
+                ACTIVE_POSITIONS[order_id] = position_record.copy()
+
+            print(f" ✅ Order placed: {order_id} | Filled @ ₹{filled_price:.2f}")
+
+            # Place SL order immediately
+            if PLACE_STOPLOSS:
+                try:
+                    sl_transaction = 'SELL' if signal_type == 'LONG' else 'BUY'
+                    sl_result = trader.place_order(
+                        instrument_key=instrument_key,
+                        quantity=qty,
+                        transaction_type=sl_transaction,
+                        product='I',
+                        order_type='SL_LIMIT',
+                        price=round(sl_price * (0.999 if signal_type == 'LONG' else 1.001), 2),
+                        trigger_price=sl_price,
+                    )
+                    print(f" 🛡️  SL order placed @ ₹{sl_price:.2f}")
+                except Exception as sl_e:
+                    print(f" ⚠️  SL order failed: {sl_e}")
+
+            return order_id
+        else:
+            print(f" ❌ Order failed for {symbol}")
+            return None
+
+    except Exception as e:
+        print(f" ❌ Intraday order error for {symbol}: {e}")
+        return None
+
+
 def place_fast_trade_order(setup, trader, symbol, instrument_key):
-    """Place OPTION orders for fast trading setups"""
+    """Place OPTION or INTRADAY EQUITY orders for fast trading setups"""
     global FAST_TRADE_ORDER_COUNT, LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED
+
+    # ── Route to intraday equity if TRADE_MODE = "intraday" ───────────────────
+    if TRADE_MODE == "intraday":
+        ltp = setup.get('current_price') or setup.get('ltp', 0)
+        return place_intraday_equity_order(
+            signal_type=setup['signal'],
+            trader=trader,
+            symbol=symbol,
+            instrument_key=instrument_key,
+            current_price=ltp,
+            strategy_tag="FAST_TRADE",
+        )
+    # ─────────────────────────────────────────────────────────────────────────
 
     if TRADING_STOPPED:
         print("⚠️ Trading stopped - no new orders")
@@ -5232,11 +5423,11 @@ def monitor_fast_trades(access_token, watchlist_symbols):
             continue
         
         # ── LATE-SESSION ENTRY BLOCK ─────────────────────────────────────────
-        current_time_str = datetime.now().strftime("%H:%M")
+        current_time_str = now_ist().strftime("%H:%M")
         skip_new_entries = (current_time_str >= NO_NEW_ENTRY_AFTER)
         if skip_new_entries and DEBUG_MODE:
             # Only print once per minute to avoid log spam
-            if datetime.now().second < 35:
+            if now_ist().second < 35:
                 print(f"⏰ Fast trade new entries blocked after {NO_NEW_ENTRY_AFTER} "
                       f"(current: {current_time_str}) — exits still managed")
         # ── END LATE-SESSION BLOCK ────────────────────────────────────────────
@@ -5271,7 +5462,7 @@ def monitor_fast_trades(access_token, watchlist_symbols):
                 # for a topping SHORT via detect_topping_reversal(strict=True).
                 # This is separate from the second-half re-watch — it catches
                 # ONGC / ETERNAL type reversals that happen at 10:30–12:15.
-                current_time_str_skip = datetime.now().strftime("%H:%M")
+                current_time_str_skip = now_ist().strftime("%H:%M")
                 in_second_half   = (ENABLE_SECOND_HALF_SHORT_REWATCH
                                     and current_time_str_skip >= SECOND_HALF_START)
                 in_early_session = (current_time_str_skip < SECOND_HALF_START)
@@ -5325,6 +5516,14 @@ def monitor_fast_trades(access_token, watchlist_symbols):
                 # Check for setups — each on its own timeframe
                 long_setup  = detect_fast_long_setup(df_15m, klinger_data)  if df_15m is not None and len(df_15m)  >= 15 else None
                 short_setup = detect_fast_short_setup(df_5m, klinger_data)  if df_5m  is not None and len(df_5m)   >= 30 else None
+
+                # ── TOPPING REVERSAL ONLY mode ────────────────────────────────────────
+                # When enabled, suppress all Bollinger LONG/SHORT squeeze signals.
+                # Only topping reversal (detect_topping_reversal) is allowed to fire.
+                if TOPPING_REVERSAL_ONLY:
+                    long_setup  = None
+                    short_setup = None
+                # ─────────────────────────────────────────────────────────────────────
 
                 # ── TOPPING REVERSAL ──────────────────────────────────────────────────
                 # detect_fast_short_setup() exits early when price > bb_middle, which
@@ -5718,7 +5917,7 @@ def log_fast_trade_entry(symbol, setup, order_id, entry_price, is_premium_estima
             ])
         
         writer.writerow([
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            now_ist().strftime('%Y-%m-%d %H:%M:%S'),
             symbol,
             setup['signal'],
             entry_price,
@@ -5778,7 +5977,7 @@ def log_fast_trade_alert(symbol, setup, order_id):
     with open(log_file, 'a', encoding='utf-8') as f:
         f.write(f"\n{'='*100}\n")
         f.write(f"FAST TRADE ALERT: {symbol} {setup['signal']}\n")
-        f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Time: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Entry Type: {setup['entry_type']}\n")
         f.write(f"Price: ₹{setup['entry_price']:.2f}\n")
         f.write(f"Stop: ₹{setup['stop_loss']:.2f}\n")
@@ -6202,7 +6401,7 @@ def reset_stale_breach_states():
     Also resets counters that have been stuck at count=1 for too many scans
     (AMBUJACEM-type fix: confirmation counter resets after 3 scans with no progress).
     """
-    current_time = datetime.now()
+    current_time = now_ist()
     stale_keys = []
     for key, state in LAST_BREAKOUT_STATE.items():
         elapsed = (current_time - state['first_breach_time']).seconds
@@ -6224,7 +6423,7 @@ def reset_stale_breach_states():
 
 def reset_stale_box_states():
     """Clean stale box breach states"""
-    current_time = datetime.now()
+    current_time = now_ist()
     stale = [k for k, s in LAST_BOX_STATE.items() 
              if (current_time - s['first_breach_time']).seconds > BREACH_TIME_WINDOW]
     for k in stale:
@@ -6232,7 +6431,7 @@ def reset_stale_box_states():
 
 def reset_stale_bounce_states():
     """Clean stale bounce states"""
-    current_time = datetime.now()
+    current_time = now_ist()
     stale = [k for k, s in LAST_BOUNCE_STATE.items() 
              if (current_time - s['first_breach_time']).seconds > BREACH_TIME_WINDOW]
     for k in stale:
@@ -6250,7 +6449,7 @@ def check_breakout(key, live):
     if info['symbol'] in R3_ALERTED_STOCKS:
         return None   # already took the R3 LONG today
     _in_second_half_r3 = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                          and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+                          and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
     if info['symbol'] in S3_ALERTED_STOCKS and not _in_second_half_r3:
         return None   # had S3 SHORT but too early for reverse LONG
     
@@ -6309,7 +6508,7 @@ def check_breakout(key, live):
         return None
 
     # VALIDATION 4: Consecutive Confirmation
-    current_time = datetime.now()
+    current_time = now_ist()
     if key not in LAST_BREAKOUT_STATE:
         LAST_BREAKOUT_STATE[key] = {
             'breach_count': 1,
@@ -6404,7 +6603,7 @@ def check_breakdown(key, live):
     if info['symbol'] in S3_ALERTED_STOCKS:
         return None   # already took the S3 SHORT today
     _in_second_half_s3 = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                          and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+                          and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
     if info['symbol'] in R3_ALERTED_STOCKS and not _in_second_half_s3:
         return None   # had R3 LONG but too early for reverse SHORT
     
@@ -6470,7 +6669,7 @@ def check_breakdown(key, live):
         return None
 
     # VALIDATION 4: Consecutive Confirmation
-    current_time = datetime.now()
+    current_time = now_ist()
     if key not in LAST_BREAKOUT_STATE or LAST_BREAKOUT_STATE[key].get('breach_type') != 'S3':
         LAST_BREAKOUT_STATE[key] = {
             'breach_count': 1,
@@ -6562,7 +6761,7 @@ def check_box_top_breakout(key, live):
         return None
     # BOX_BOTTOM (SHORT) fired earlier → allow BOX_TOP LONG re-entry only in 2nd half
     _in_second_half_box_top = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                                and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+                                and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
     if info['symbol'] in BOX_BOTTOM_ALERTED_STOCKS and not _in_second_half_box_top:
         return None   # had BOX_BOTTOM SHORT but too early for reverse LONG
 
@@ -6710,7 +6909,7 @@ def check_box_bottom_breakdown(key, live):
         return None
     # BOX_TOP fired earlier → only allow if we're in the second half
     _in_second_half_box = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                           and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+                           and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
     if info['symbol'] in BOX_TOP_ALERTED_STOCKS and not _in_second_half_box:
         return None
 
@@ -6857,7 +7056,7 @@ def check_box_support_bounce(key, live):
         return None
     # REJECT_TOP (SHORT) fired earlier → allow BOUNCE_BOTTOM LONG re-entry only in 2nd half
     _in_second_half_bounce = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                               and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+                               and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
     if info['symbol'] in RANGE_REJECT_ALERTED_STOCKS and not _in_second_half_bounce:
         return None   # had REJECT_TOP SHORT but too early for reverse LONG
 
@@ -6981,7 +7180,7 @@ def check_box_resistance_rejection(key, live):
         return None
     # BOUNCE_BOTTOM fired earlier → only allow if we're in the second half
     _in_second_half_range = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                             and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+                             and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
     if info['symbol'] in RANGE_BOUNCE_ALERTED_STOCKS and not _in_second_half_range:
         return None
 
@@ -7145,7 +7344,29 @@ def detect_gaps(live_data):
                 gap_stocks['gap_up'].append(gap_info)
             else:
                 gap_stocks['gap_down'].append(gap_info)
-                
+
+    # ── Market crash filter ───────────────────────────────────────────────────
+    # On broad crash days (many stocks gap down together) the signal quality
+    # drops sharply because most gaps bounce before confirming. Limit to the
+    # 3 strongest gaps (by gap_percent magnitude) to preserve order budget.
+    CRASH_GAP_COUNT_THRESHOLD = 8   # if >8 gap-down stocks detected, it's a crash day
+    MAX_GAPS_ON_CRASH_DAY     = 3   # only trade top-3 strongest on crash days
+
+    if len(gap_stocks['gap_down']) > CRASH_GAP_COUNT_THRESHOLD:
+        gap_stocks['gap_down'] = sorted(
+            gap_stocks['gap_down'],
+            key=lambda x: abs(x['gap_percent']),
+            reverse=True
+        )[:MAX_GAPS_ON_CRASH_DAY]
+
+    if len(gap_stocks['gap_up']) > CRASH_GAP_COUNT_THRESHOLD:
+        gap_stocks['gap_up'] = sorted(
+            gap_stocks['gap_up'],
+            key=lambda x: abs(x['gap_percent']),
+            reverse=True
+        )[:MAX_GAPS_ON_CRASH_DAY]
+    # ─────────────────────────────────────────────────────────────────────────
+
     return gap_stocks
 
 def calculate_gap_fill_percent(gap_info):
@@ -7282,7 +7503,7 @@ def should_place_gap_trade(gap_info, signal):
     already_up   = symbol in GAP_UP_ALERTED_STOCKS
     already_down = symbol in GAP_DOWN_ALERTED_STOCKS
     _in_second_half_gap = (ENABLE_SECOND_HALF_SHORT_REWATCH
-                           and datetime.now().strftime("%H:%M") >= SECOND_HALF_START)
+                           and now_ist().strftime("%H:%M") >= SECOND_HALF_START)
 
     if gap_direction == 'CE':
         if already_up:
@@ -8147,7 +8368,7 @@ def verify_order_result(trader, result, symbol):
         return None
 
 def place_breakout_order(breakout_data, trader):
-    """Place OPTION orders for R3/S3/Box/Range breakouts"""
+    """Place OPTION or INTRADAY EQUITY orders for R3/S3/Box/Range breakouts"""
     global DAILY_ORDER_COUNT, BOX_ORDER_COUNT, RANGE_ORDER_COUNT, LAST_ORDER_TIME
     global PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED
 
@@ -8156,17 +8377,30 @@ def place_breakout_order(breakout_data, trader):
         return None
 
     # Guard: Upstox rejects orders outside 05:30–23:59 with HTTP 423.
-    # Check here (before option-chain lookup) to avoid wasted API calls.
     if not is_order_time_allowed():
         symbol   = breakout_data.get('symbol', '?')
         strategy = breakout_data.get('strategy', 'UNKNOWN')
         print(f"⏭️  {symbol} {strategy}: order skipped — outside Upstox service hours (05:30–23:59 IST)")
         return None
 
-    symbol = breakout_data['symbol']
+    symbol         = breakout_data['symbol']
     underlying_key = breakout_data['instrument_key']
-    breakout_type = breakout_data.get('breakout_type', 'CE')
-    strategy = breakout_data.get('strategy', 'UNKNOWN')
+    breakout_type  = breakout_data.get('breakout_type', 'CE')
+    strategy       = breakout_data.get('strategy', 'UNKNOWN')
+
+    # ── Route to intraday equity if TRADE_MODE = "intraday" ───────────────────
+    if TRADE_MODE == "intraday":
+        signal_type = 'LONG' if breakout_type == 'CE' else 'SHORT'
+        ltp = breakout_data.get('current_price', 0)
+        return place_intraday_equity_order(
+            signal_type=signal_type,
+            trader=trader,
+            symbol=symbol,
+            instrument_key=underlying_key,
+            current_price=ltp,
+            strategy_tag=strategy,
+        )
+    # ─────────────────────────────────────────────────────────────────────────
 
     option_type = 'CE' if breakout_type == 'CE' else 'PE'
 
@@ -8309,6 +8543,50 @@ def place_gap_order(gap_info, signal, trader):
     symbol = gap_info['symbol']
     underlying_key = gap_info['instrument_key']
     direction = signal['direction']
+
+    # ── 15-min gap confirmation check ────────────────────────────────────────
+    # Verify price is STILL confirming the gap direction at entry time.
+    # If price has recovered above/below open, gap has filled — skip trade.
+    current_ltp = gap_info.get('current_price', 0)
+    open_price  = gap_info.get('open_price', 0)
+    gap_pct     = gap_info.get('gap_percent', 0)
+    if open_price and current_ltp:
+        gap_pts  = abs(open_price - gap_info.get('yesterday_close', open_price))
+        fill_pct = ((current_ltp - open_price) / gap_pts * 100) if gap_pts else 0
+        if direction in ('SHORT', 'PE') and gap_pct < 0:
+            if current_ltp > open_price:
+                print(f"⏭️  {symbol} GAP-DOWN skipped — price {current_ltp:.2f} recovered "
+                      f"above open {open_price:.2f}. Gap filled, no entry.")
+                return None
+            if fill_pct > 30:
+                print(f"⏭️  {symbol} GAP-DOWN skipped — {fill_pct:.0f}% gap filled, "
+                      f"move likely exhausted ({current_ltp:.2f} vs open {open_price:.2f}).")
+                return None
+        elif direction in ('LONG', 'CE') and gap_pct > 0:
+            if current_ltp < open_price:
+                print(f"⏭️  {symbol} GAP-UP skipped — price {current_ltp:.2f} dropped "
+                      f"below open {open_price:.2f}. Gap filled, no entry.")
+                return None
+            if abs(fill_pct) > 30:
+                print(f"⏭️  {symbol} GAP-UP skipped — {abs(fill_pct):.0f}% gap filled, "
+                      f"move likely exhausted ({current_ltp:.2f} vs open {open_price:.2f}).")
+                return None
+        print(f"✅ {symbol} 15-min gap confirmed: price {current_ltp:.2f} "
+              f"vs open {open_price:.2f} — proceeding with entry.")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Route to intraday equity if TRADE_MODE = "intraday" ───────────────────
+    if TRADE_MODE == "intraday":
+        signal_type = 'LONG' if direction in ('LONG', 'CE') else 'SHORT'
+        return place_intraday_equity_order(
+            signal_type=signal_type,
+            trader=trader,
+            symbol=symbol,
+            instrument_key=underlying_key,
+            current_price=current_ltp or gap_info.get('current_price', 0),
+            strategy_tag="GAP",
+        )
+    # ─────────────────────────────────────────────────────────────────────────
 
     option_type = 'CE' if direction == 'LONG' else 'PE'
 
@@ -8534,7 +8812,7 @@ def send_alert(b, trader=None):
     with open(csv_file, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            now_ist().strftime('%Y-%m-%d %H:%M:%S'),
             s,
             b.get('breakout_type', 'CE'),
             f"{b['current_price']:.2f}",
@@ -8581,7 +8859,7 @@ def print_final_stats():
     print(f"\n{'='*100}")
     print("⚡ TRADING SESSION COMPLETE")
     print(f"{'='*100}")
-    print(f"Time: {datetime.now().strftime('%H:%M:%S')}")
+    print(f"Time: {now_ist().strftime('%H:%M:%S')}")
     print(f"Total Stocks Monitored: {len(R3_LEVELS)}")
     print(f"\n📊 ALERTS SUMMARY:")
     print(f" • R3/S3 Alerts: {len(ALERTED_STOCKS)} (R3={len(R3_ALERTED_STOCKS)}, S3={len(S3_ALERTED_STOCKS)})")
@@ -8720,7 +8998,7 @@ def print_final_stats():
     # Final log
     with open(ALERT_LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"\n{'='*100}\n")
-        f.write(f"SESSION END: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"SESSION END: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"R3/S3 Alerts: {len(ALERTED_STOCKS)} | Orders: {DAILY_ORDER_COUNT}\n")
         f.write(f"Box Theory Alerts: {len(BOX_ALERTED_STOCKS)} | Orders: {BOX_ORDER_COUNT}\n")
         f.write(f"Range Trading Alerts: {len(RANGE_ALERTED_STOCKS)} | Orders: {RANGE_ORDER_COUNT}\n")
@@ -8766,7 +9044,7 @@ def enhanced_monitor(access_token, keys, symbols):
                 print(f"   ⏳ Waiting for 05:30... {remaining//60}m {remaining%60}s remaining",
                       flush=True)
             time.sleep(30)
-        print(f"\n✅ Order window open ({datetime.now().strftime('%H:%M:%S')}) — starting scans.\n")
+        print(f"\n✅ Order window open ({now_ist().strftime('%H:%M:%S')}) — starting scans.\n")
     # ─────────────────────────────────────────────────────────────────────────
     print(f"🔥 Klinger Filter: {'ENABLED ✓' if ENABLE_KLINGER_FILTER else 'DISABLED'}")
     if ENABLE_KLINGER_FILTER:
@@ -8827,10 +9105,10 @@ def enhanced_monitor(access_token, keys, symbols):
     
     scan_count = 0
     klinger_update_batch = []
-    last_position_check = datetime.now()
-    last_position_sync = datetime.now()
-    last_summary_print = datetime.now()
-    last_cache_cleanup = datetime.now()
+    last_position_check = now_ist()
+    last_position_sync = now_ist()
+    last_summary_print = now_ist()
+    last_cache_cleanup = now_ist()
     
     try:
         # Initialize FII/DII and ORB
@@ -8850,7 +9128,7 @@ def enhanced_monitor(access_token, keys, symbols):
             # but calling it here with empty live_data is harmless (it won't
             # process anything useful without live prices). We just prime the
             # state so scan #1 doesn't need to re-trigger the primary pass.
-            _now = datetime.now()
+            _now = now_ist()
             _920 = _now.replace(hour=9, minute=20, second=0, microsecond=0)
             _cutoff = _920 + timedelta(minutes=ORB_BREAKOUT_WINDOW_MINUTES)
             _ct = _now.strftime("%H:%M")
@@ -8862,7 +9140,7 @@ def enhanced_monitor(access_token, keys, symbols):
         
         while True:
             scan_count += 1
-            current_time = datetime.now()
+            current_time = now_ist()
 
             # Clear intraday candle cache from previous scan cycle.
             # The fast-trade prefetch (in monitor_fast_trades thread) refills it
@@ -8961,7 +9239,7 @@ def enhanced_monitor(access_token, keys, symbols):
                     print(f"\n⏰ Market closing - Exiting remaining positions")
                     exit_all_positions(trader, "MARKET_CLOSE")
                 
-                print(f"💤 Market closed. Waiting... ({datetime.now().strftime('%H:%M:%S')})", flush=True)
+                print(f"💤 Market closed. Waiting... ({now_ist().strftime('%H:%M:%S')})", flush=True)
                 time.sleep(60)
                 continue
                 
@@ -8985,7 +9263,7 @@ def enhanced_monitor(access_token, keys, symbols):
                 live_data = None
 
             if not is_market_stabilized():
-                print(f"⏳ Market stabilizing... ({datetime.now().strftime('%H:%M:%S')})", flush=True)
+                print(f"⏳ Market stabilizing... ({now_ist().strftime('%H:%M:%S')})", flush=True)
                 time.sleep(30)
                 continue
                 
@@ -9023,13 +9301,19 @@ def enhanced_monitor(access_token, keys, symbols):
                             
                             if signal and should_place_gap_trade(gap, signal):
                                 symbol = gap['symbol']
-                                # Write to direction-specific set + legacy alias
                                 _gap_dir = signal.get('direction', '').upper()
-                                if _gap_dir == 'CE':
-                                    GAP_UP_ALERTED_STOCKS.add(symbol)
-                                elif _gap_dir == 'PE':
-                                    GAP_DOWN_ALERTED_STOCKS.add(symbol)
-                                GAP_ALERTED_STOCKS.add(symbol)  # legacy alias
+                                # ── Atomic check-and-add (prevents race condition) ──
+                                _lock_key = 'GAP_DOWN_ALERTED_STOCKS' if _gap_dir == 'PE' else 'GAP_UP_ALERTED_STOCKS'
+                                with SIGNAL_LOCKS.get(_lock_key, threading.RLock()):
+                                    if _gap_dir == 'PE' and symbol in GAP_DOWN_ALERTED_STOCKS:
+                                        continue
+                                    if _gap_dir == 'CE' and symbol in GAP_UP_ALERTED_STOCKS:
+                                        continue
+                                    if _gap_dir == 'CE':
+                                        GAP_UP_ALERTED_STOCKS.add(symbol)
+                                    elif _gap_dir == 'PE':
+                                        GAP_DOWN_ALERTED_STOCKS.add(symbol)
+                                    GAP_ALERTED_STOCKS.add(symbol)
                                 
                                 print("\n" + "="*120)
                                 print(f"⚡ GAP TRADING SIGNAL: {symbol} ⚡")
@@ -9045,7 +9329,7 @@ def enhanced_monitor(access_token, keys, symbols):
                                 with open(GAP_CSV_FILE, 'a', newline='', encoding='utf-8') as f:
                                     writer = csv.writer(f)
                                     writer.writerow([
-                                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                        now_ist().strftime('%Y-%m-%d %H:%M:%S'),
                                         symbol,
                                         gap_type,
                                         signal['signal'],
@@ -9175,7 +9459,7 @@ def run_trading_bot(access_token):
     # Session log
     with open(ALERT_LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"\n{'='*100}\n")
-        f.write(f"SESSION START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"SESSION START: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Stocks: {len(R3_LEVELS)}\n")
         f.write(f"Strategies: R3/S3={'ON' if ENABLE_AUTO_TRADING else 'OFF'} | ")
         f.write(f"Box Theory={'ON' if ENABLE_BOX_TRADING else 'OFF'} | ")
