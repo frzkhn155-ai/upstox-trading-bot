@@ -30,8 +30,8 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
+        run: pip install pyperclip pandas requests selenium webdriver-manager beautifulsoup4
+        
       - name: Run trading bot
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
